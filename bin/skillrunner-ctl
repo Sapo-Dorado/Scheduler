@@ -17,6 +17,64 @@ ensure_config() {
     fi
 }
 
+# sync_skills — clone or update skill dependencies declared in .skillrunner.json
+# Skills are installed into <project>/.claude/skills/<name>/
+sync_skills() {
+    local project_path="$1"
+    local project_config="${project_path}/.skillrunner.json"
+
+    local skill_count
+    skill_count=$(jq '.skills // [] | length' "$project_config")
+    [[ "$skill_count" -eq 0 ]] && return 0
+
+    local skills_dir="${project_path}/.claude/skills"
+    mkdir -p "$skills_dir"
+
+    echo "Syncing ${skill_count} skill dependency(ies)..."
+
+    for ((i = 0; i < skill_count; i++)); do
+        local name git_url ref
+        name=$(jq -r ".skills[$i].name" "$project_config")
+        git_url=$(jq -r ".skills[$i].git" "$project_config")
+        ref=$(jq -r ".skills[$i].ref // \"main\"" "$project_config")
+
+        local skill_dir="${skills_dir}/${name}"
+
+        if [[ -z "$name" || "$name" == "null" || -z "$git_url" || "$git_url" == "null" ]]; then
+            echo "  SKIP: skill entry $i is missing name or git url"
+            continue
+        fi
+
+        if [[ -d "$skill_dir/.git" ]]; then
+            # Existing clone — fetch and checkout the right ref
+            echo "  Updating skill '${name}' (${ref})..."
+            (cd "$skill_dir" && git fetch origin --quiet && git checkout "$ref" --quiet 2>/dev/null && git pull origin "$ref" --quiet 2>/dev/null) || {
+                echo "  WARNING: Failed to update skill '${name}'"
+                continue
+            }
+        else
+            # Fresh clone
+            echo "  Cloning skill '${name}' from ${git_url} (${ref})..."
+            rm -rf "$skill_dir"
+            git clone --quiet --branch "$ref" "$git_url" "$skill_dir" 2>/dev/null || {
+                # Branch might not exist as a branch name, try clone + checkout
+                git clone --quiet "$git_url" "$skill_dir" 2>/dev/null && \
+                    (cd "$skill_dir" && git checkout "$ref" --quiet 2>/dev/null) || {
+                    echo "  ERROR: Failed to clone skill '${name}' from ${git_url}"
+                    continue
+                }
+            }
+        fi
+
+        # Verify the skill has a SKILL.md
+        if [[ -f "${skill_dir}/SKILL.md" ]]; then
+            echo "  OK: skill '${name}' installed at .claude/skills/${name}/"
+        else
+            echo "  WARNING: skill '${name}' cloned but no SKILL.md found in repo root"
+        fi
+    done
+}
+
 cmd_register() {
     local project_path="${1:-.}"
     project_path="$(cd "$project_path" && pwd)"
@@ -67,6 +125,9 @@ cmd_register() {
     done
 
     echo "Registered ${count} schedule(s) from ${project_path}"
+
+    # Sync skill dependencies
+    sync_skills "$project_path"
 }
 
 cmd_unregister() {

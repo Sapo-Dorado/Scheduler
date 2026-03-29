@@ -21,7 +21,7 @@
             src = ./.;
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            buildInputs = [ pkgs.bash pkgs.jq pkgs.coreutils pkgs.openssl pkgs.curl ];
+            buildInputs = [ pkgs.bash pkgs.jq pkgs.coreutils pkgs.openssl pkgs.curl pkgs.git ];
 
             installPhase = ''
               mkdir -p $out/bin $out/lib $out/share/skillrunner
@@ -35,7 +35,7 @@
                 wrapProgram "$out/bin/$(basename $script)" \
                   --set SKILLRUNNER_LIB "$out/lib" \
                   --prefix PATH : "${pkgs.lib.makeBinPath [
-                    pkgs.bash pkgs.jq pkgs.coreutils pkgs.openssl pkgs.curl
+                    pkgs.bash pkgs.jq pkgs.coreutils pkgs.openssl pkgs.curl pkgs.git
                   ]}"
               done
 

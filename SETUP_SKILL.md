@@ -54,10 +54,84 @@ hour, and a daily skill that reads that file and summarizes findings.
 ### Step 3: For each task, gather details
 - Schedule (natural language is fine, you'll convert to cron)
 - For commands: help write the command or script if needed
-- For skills: check if the skill exists in `~/.claude/skills/` or the
-  project's `.claude/skills/`, offer to help create it if not
+- For skills: determine where the skill comes from (see Skill Management below)
 - Timeout and retry settings
 - Notification preferences (if they've set up Telegram)
+
+### Skill Management
+
+When a schedule uses `"type": "skill"`, the skill must be available in
+`.claude/skills/<name>/SKILL.md` (project-local) or `~/.claude/skills/<name>/SKILL.md`
+(global). There are three ways to set up a skill:
+
+#### A) Create a new skill for this project
+
+If the user needs a custom skill that doesn't exist yet:
+
+1. Create the directory: `.claude/skills/<skill-name>/`
+2. Write a `SKILL.md` with proper frontmatter:
+   ```markdown
+   ---
+   name: <skill-name>
+   description: >
+     What this skill does, in one or two sentences.
+   user-invocable: true
+   argument-hint: "<expected arguments>"
+   allowed-tools: Read, Bash, Glob, Grep
+   ---
+
+   # Skill Title
+
+   Instructions for Claude on how to execute this skill...
+   ```
+3. Remind the user to commit `.claude/skills/<skill-name>/SKILL.md` to git
+
+#### B) Install a skill from a GitHub repo
+
+If the skill is published in a git repository, add it to the `skills`
+array in `.skillrunner.json`:
+
+```json
+{
+  "version": 1,
+  "skills": [
+    {
+      "name": "concert-search",
+      "git": "https://github.com/someone/concert-search-skill.git",
+      "ref": "main"
+    }
+  ],
+  "schedules": [...]
+}
+```
+
+When the user runs `skillrunner-ctl register`, it will automatically
+clone or update each skill dependency into `.claude/skills/<name>/`.
+
+- `name` — the skill name (becomes the directory name and slash command)
+- `git` — the git clone URL (HTTPS or SSH)
+- `ref` — branch, tag, or commit hash (default: `main`)
+
+The cloned repo must have a `SKILL.md` at its root.
+
+Ask the user if the skill repo is public or if they need SSH access.
+For private repos, SSH URLs (e.g. `git@github.com:org/skill.git`) work
+if the user has SSH keys configured.
+
+**Important:** Add `.claude/skills/` entries installed via git to
+`.gitignore` so cloned skill repos aren't committed into the project:
+```
+# Git-managed skills (installed by skillrunner)
+.claude/skills/<skill-name>/
+```
+
+#### C) Use an existing global skill
+
+If the skill is already installed globally in `~/.claude/skills/`, no
+config is needed — Claude will find it automatically when the daemon
+runs from the project directory.
+
+Help the user check: `ls ~/.claude/skills/` to see what's available.
 
 ### Step 4: Create .skillrunner.json
 Write the config file to the project root.
@@ -78,5 +152,9 @@ everything is registered correctly.
   and save it in the project (e.g., `scripts/check-health.sh`)
 - Always make scripts executable (`chmod +x`)
 - If the user needs a Claude skill that doesn't exist, help them create
-  it in `.claude/skills/` with a proper SKILL.md
-- Remind the user to commit `.skillrunner.json` and any new scripts to git
+  it in `.claude/skills/<name>/SKILL.md` with proper frontmatter
+- For skills from GitHub repos, add them to the `skills` array in
+  `.skillrunner.json` — they'll be cloned on `skillrunner-ctl register`
+- Add git-managed skill directories to `.gitignore`
+- Remind the user to commit `.skillrunner.json`, any new scripts, and
+  any locally-created skills to git

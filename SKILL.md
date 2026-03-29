@@ -29,11 +29,26 @@ Each schedule has a `type` field:
 - `"skill"` — runs a Claude Code skill via `claude -p "/<skill> <args>"` (costs API credits)
 - `"command"` — runs a bash command directly (free, no Claude involved)
 
+## Skill Dependencies
+
+`.skillrunner.json` can declare skill dependencies via the `skills` array:
+```json
+{
+  "skills": [
+    {"name": "my-skill", "git": "https://github.com/user/skill-repo.git", "ref": "main"}
+  ],
+  "schedules": [...]
+}
+```
+When registering, `skillrunner-ctl register` clones/updates each skill
+into `.claude/skills/<name>/`. The skill repo must have a `SKILL.md` at its root.
+
 ## Commands
 
 ### /schedule register [path]
 Register a project directory with SkillRunner. Reads `.skillrunner.json` from
-the project root (defaults to cwd) and adds its schedules to the global config.
+the project root (defaults to cwd), adds its schedules to the global config,
+and clones/updates any skill dependencies declared in the `skills` array.
 Run: `skillrunner-ctl register [path]`
 
 ### /schedule unregister [path]
