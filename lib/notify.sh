@@ -27,10 +27,10 @@ send_telegram() {
     local response http_code
     response=$(curl -s -w "\n%{http_code}" -X POST \
         "https://api.telegram.org/bot${token}/sendMessage" \
-        -d chat_id="$chat_id" \
-        -d parse_mode="Markdown" \
-        -d text="$text" \
-        -d disable_web_page_preview="true")
+        --data-urlencode "chat_id=$chat_id" \
+        --data-urlencode "parse_mode=Markdown" \
+        --data-urlencode "text=$text" \
+        --data-urlencode "disable_web_page_preview=true")
 
     http_code=$(echo "$response" | tail -1)
 
@@ -46,16 +46,29 @@ send_telegram() {
 # the environment variables set by the caller.
 expand_template() {
     local tmpl="$1"
-    tmpl="${tmpl//\$\{name\}/$notify_skill}"
-    tmpl="${tmpl//\$\{status\}/$notify_status}"
-    tmpl="${tmpl//\$\{exit_code\}/$notify_exit_code}"
-    tmpl="${tmpl//\$\{duration\}/$notify_duration}"
-    tmpl="${tmpl//\$\{cost\}/$notify_cost}"
-    tmpl="${tmpl//\$\{attempts\}/$notify_attempts}"
-    tmpl="${tmpl//\$\{max_attempts\}/$notify_max_attempts}"
-    tmpl="${tmpl//\$\{project_path\}/$notify_project_path}"
-    tmpl="${tmpl//\$\{result_preview\}/$notify_result_preview}"
-    tmpl="${tmpl//\$\{timestamp\}/$notify_timestamp}"
+    # Build a jq filter to safely replace all template variables.
+    # jq's gsub handles special characters correctly.
+    tmpl=$(printf '%s' "$tmpl" | jq -Rrs \
+        --arg name "$notify_skill" \
+        --arg status "$notify_status" \
+        --arg exit_code "$notify_exit_code" \
+        --arg duration "$notify_duration" \
+        --arg cost "$notify_cost" \
+        --arg attempts "$notify_attempts" \
+        --arg max_attempts "$notify_max_attempts" \
+        --arg project_path "$notify_project_path" \
+        --arg result_preview "$notify_result_preview" \
+        --arg timestamp "$notify_timestamp" \
+        'gsub("\\$\\{name\\}"; $name)
+         | gsub("\\$\\{status\\}"; $status)
+         | gsub("\\$\\{exit_code\\}"; $exit_code)
+         | gsub("\\$\\{duration\\}"; $duration)
+         | gsub("\\$\\{cost\\}"; $cost)
+         | gsub("\\$\\{attempts\\}"; $attempts)
+         | gsub("\\$\\{max_attempts\\}"; $max_attempts)
+         | gsub("\\$\\{project_path\\}"; $project_path)
+         | gsub("\\$\\{result_preview\\}"; $result_preview)
+         | gsub("\\$\\{timestamp\\}"; $timestamp)')
     echo "$tmpl"
 }
 
