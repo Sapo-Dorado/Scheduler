@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Executes a single scheduled skill run.
+# Usage: skillrunner-run <schedule_id>
+
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
+CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
+RUNS_LOG="${SKILLRUNNER_HOME}/logs/runs.jsonl"
+OUTPUT_DIR="${SKILLRUNNER_HOME}/logs/output"
+
+SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
+source "${SKILLRUNNER_LIB}/logging.sh"
+source "${SKILLRUNNER_LIB}/lock.sh"
+source "${SKILLRUNNER_LIB}/notify.sh"
+
+SCHEDULE_ID="$1"
+RUN_ID=$(openssl rand -hex 8)
+
+# Read schedule config
+schedule_json=$(jq -c ".schedules[] | select(.id == \"${SCHEDULE_ID}\")" "$CONFIG_FILE")
+if [[ -z "$schedule_json" ]]; then
+    log_daemon "ERROR: Schedule ${SCHEDULE_ID} not found in config"
+    exit 1
+fi
+
+run_type=$(echo "$schedule_json" | jq -r '.type // "skill"')
+workdir=$(echo "$schedule_json" | jq -r '.project_path // env.HOME')
+timeout_secs=$(echo "$schedule_json" | jq -r '.timeout_seconds // 300')
+max_attempts=$(echo "$schedule_json" | jq -r '.retry.max_attempts // 1')
+retry_delay=$(echo "$schedule_json" | jq -r '.retry.delay_seconds // 60')
+
+# Type-specific fields
+skill=""
+args=""
+command=""
+permission_mode="plan"
+max_budget="0.50"
+
+if [[ "$run_type" == "skill" ]]; then
+    skill=$(echo "$schedule_json" | jq -r '.skill')
+    args=$(echo "$schedule_json" | jq -r '.args // ""')
+    permission_mode=$(echo "$schedule_json" | jq -r '.permission_mode // "plan"')
+    max_budget=$(echo "$schedule_json" | jq -r '.max_budget_usd // 0.50')
+elif [[ "$run_type" == "command" ]]; then
+    command=$(echo "$schedule_json" | jq -r '.command')
+fi
+
+# Display name for logging
+run_name="${skill:-${command}}"
+
+# Acquire lock (atomic mkdir)
+acquire_lock "$SCHEDULE_ID" || {
+    log_daemon "Failed to acquire lock for ${SCHEDULE_ID}"
+    exit 1
+}
+trap 'release_lock "$SCHEDULE_ID"' EXIT
+
+start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+start_epoch=$(date +%s)
+
+log_daemon "RUN ${RUN_ID}: Starting ${run_type} '${run_name}' in ${workdir}"
+
+attempt=0
+exit_code=1
+stdout_file="${OUTPUT_DIR}/${RUN_ID}.stdout"
+stderr_file="${OUTPUT_DIR}/${RUN_ID}.stderr"
+
+while (( attempt < max_attempts )); do
+    attempt=$((attempt + 1))
+    log_daemon "RUN ${RUN_ID}: Attempt ${attempt}/${max_attempts}"
+
+    set +e
+    if [[ "$run_type" == "skill" ]]; then
+        # Build skill prompt (no `local` — we're at top level)
+        prompt="/${skill}"
+        [[ -n "$args" ]] && prompt="/${skill} ${args}"
+
+        # Invoke Claude Code from the project directory
+        (
+            cd "$workdir" 2>/dev/null || cd "$HOME"
+            timeout "${timeout_secs}" \
+                claude -p \
+                    --output-format json \
+                    --permission-mode "$permission_mode" \
+                    --max-budget-usd "$max_budget" \
+                    --no-session-persistence \
+                    "$prompt"
+        ) > "$stdout_file" 2> "$stderr_file" < /dev/null
+        exit_code=$?
+    elif [[ "$run_type" == "command" ]]; then
+        # Run bash command directly
+        (
+            cd "$workdir" 2>/dev/null || cd "$HOME"
+            timeout "${timeout_secs}" \
+                bash -c "$command"
+        ) > "$stdout_file" 2> "$stderr_file" < /dev/null
+        exit_code=$?
+    fi
+    set -e
+
+    if [[ $exit_code -eq 124 ]]; then
+        log_daemon "RUN ${RUN_ID}: Timed out after ${timeout_secs}s"
+    fi
+
+    if [[ $exit_code -eq 0 ]]; then
+        break
+    fi
+
+    if (( attempt < max_attempts )); then
+        log_daemon "RUN ${RUN_ID}: Failed (exit ${exit_code}), retrying in ${retry_delay}s"
+        sleep "$retry_delay"
+    fi
+done
+
+end_epoch=$(date +%s)
+duration=$((end_epoch - start_epoch))
+end_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Parse output based on type
+cost="null"
+result_text=""
+status="success"
+
+if [[ -f "$stdout_file" ]]; then
+    if [[ "$run_type" == "skill" ]]; then
+        # Skill output is JSON from Claude
+        if jq -e '.total_cost_usd' "$stdout_file" > /dev/null 2>&1; then
+            cost=$(jq '.total_cost_usd' "$stdout_file")
+            result_text=$(jq -r '.result // ""' "$stdout_file" | head -c 2000)
+        fi
+        if jq -e '.is_error == true' "$stdout_file" > /dev/null 2>&1; then
+            status="failure"
+        fi
+    elif [[ "$run_type" == "command" ]]; then
+        # Command output is raw text
+        result_text=$(head -c 2000 "$stdout_file")
+    fi
+fi
+
+[[ $exit_code -ne 0 ]] && status="failure"
+
+# Truncate large output files (> 100KB) — no `local` at top level
+for f in "$stdout_file" "$stderr_file"; do
+    if [[ -f "$f" ]]; then
+        file_size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+        if (( file_size > 102400 )); then
+            truncate -s 102400 "$f"
+            echo -e "\n\n[TRUNCATED - output exceeded 100KB]" >> "$f"
+        fi
+    fi
+done
+
+# Write structured log entry (atomic via temp file + append)
+log_entry=$(jq -n \
+    --arg run_id "$RUN_ID" \
+    --arg schedule_id "$SCHEDULE_ID" \
+    --arg type "$run_type" \
+    --arg name "$run_name" \
+    --arg skill "$skill" \
+    --arg command "$command" \
+    --arg args "$args" \
+    --arg project_path "$workdir" \
+    --arg start "$start_time" \
+    --arg end "$end_time" \
+    --argjson duration "$duration" \
+    --argjson exit_code "$exit_code" \
+    --arg status "$status" \
+    --argjson cost "$cost" \
+    --argjson attempts "$attempt" \
+    --arg result_preview "$result_text" \
+    --arg stdout_file "$stdout_file" \
+    --arg stderr_file "$stderr_file" \
+    '{
+        run_id: $run_id,
+        schedule_id: $schedule_id,
+        type: $type,
+        name: $name,
+        skill: $skill,
+        command: $command,
+        args: $args,
+        project_path: $project_path,
+        started_at: $start,
+        ended_at: $end,
+        duration_seconds: $duration,
+        exit_code: $exit_code,
+        status: $status,
+        cost_usd: $cost,
+        attempts: $attempts,
+        result_preview: $result_preview,
+        stdout_file: $stdout_file,
+        stderr_file: $stderr_file
+    }'
+)
+
+echo "$log_entry" >> "$RUNS_LOG"
+
+log_daemon "RUN ${RUN_ID}: ${run_type} '${run_name}' completed (${status}, ${duration}s, exit ${exit_code}, cost \$${cost})"
+
+# --- Notification dispatch ---
+# Set notify_* variables for template expansion and dispatch
+notify_skill="$run_name"
+notify_status="$status"
+notify_exit_code="$exit_code"
+notify_duration="$duration"
+notify_cost="$cost"
+notify_attempts="$attempt"
+notify_max_attempts="$max_attempts"
+notify_project_path="$workdir"
+notify_result_preview="${result_text:0:500}"
+notify_timestamp="$end_time"
+
+dispatch_notification "$schedule_json"

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
+CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
+
+SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
+source "${SKILLRUNNER_LIB}/logging.sh"
+
+ensure_config() {
+    mkdir -p "${SKILLRUNNER_HOME}"/{logs/output,locks}
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo '{"version": 1, "projects": [], "schedules": []}' | jq . > "$CONFIG_FILE"
+    fi
+    if [[ ! -f "${SKILLRUNNER_HOME}/state.json" ]]; then
+        echo '{"last_wake": null, "pid": null, "version": 1}' | jq . > "${SKILLRUNNER_HOME}/state.json"
+    fi
+}
+
+cmd_register() {
+    local project_path="${1:-.}"
+    project_path="$(cd "$project_path" && pwd)"
+
+    local project_config="${project_path}/.skillrunner.json"
+    if [[ ! -f "$project_config" ]]; then
+        echo "ERROR: No .skillrunner.json found in ${project_path}"
+        exit 1
+    fi
+
+    ensure_config
+
+    # Remove existing schedules for this project
+    local tmp
+    tmp=$(mktemp)
+    jq --arg pp "$project_path" '
+        .schedules = [.schedules[] | select(.project_path != $pp)] |
+        .projects = [.projects[] | select(.path != $pp)]
+    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+    # Read project config and merge schedules
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Add project entry
+    tmp=$(mktemp)
+    jq --arg pp "$project_path" --arg ts "$now_iso" '
+        .projects += [{"path": $pp, "registered_at": $ts}]
+    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+    # Add each schedule with generated ID
+    local count
+    count=$(jq '.schedules | length' "$project_config")
+
+    for ((i = 0; i < count; i++)); do
+        local sid
+        sid=$(openssl rand -hex 4)
+
+        tmp=$(mktemp)
+        jq --arg pp "$project_path" --arg sid "$sid" --arg ts "$now_iso" \
+            --argjson sched "$(jq -c ".schedules[$i]" "$project_config")" '
+            .schedules += [$sched + {
+                "id": $sid,
+                "project_path": $pp,
+                "registered_at": $ts
+            }]
+        ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+    done
+
+    echo "Registered ${count} schedule(s) from ${project_path}"
+}
+
+cmd_unregister() {
+    local project_path="${1:-.}"
+    project_path="$(cd "$project_path" && pwd)"
+
+    local tmp
+    tmp=$(mktemp)
+    jq --arg pp "$project_path" '
+        .schedules = [.schedules[] | select(.project_path != $pp)] |
+        .projects = [.projects[] | select(.path != $pp)]
+    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+    echo "Unregistered all schedules for ${project_path}"
+}
+
+cmd_status() {
+    echo "=== SkillRunner Status ==="
+
+    # Check daemon (systemd or launchctl)
+    if systemctl --user is-active skillrunner.timer &>/dev/null; then
+        echo "Daemon: RUNNING (systemd timer)"
+    elif launchctl list 2>/dev/null | grep -q "com.skillrunner.daemon"; then
+        echo "Daemon: RUNNING (LaunchAgent)"
+    else
+        echo "Daemon: STOPPED"
+    fi
+
+    if [[ -f "${SKILLRUNNER_HOME}/state.json" ]]; then
+        echo "Last wake: $(jq -r '.last_wake // "never"' "${SKILLRUNNER_HOME}/state.json")"
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local sched_count proj_count
+        sched_count=$(jq '.schedules | length' "$CONFIG_FILE")
+        proj_count=$(jq '.projects | length' "$CONFIG_FILE")
+        echo "Projects: ${proj_count}"
+        echo "Schedules: ${sched_count}"
+    fi
+
+    if [[ -f "${SKILLRUNNER_HOME}/logs/runs.jsonl" ]]; then
+        echo ""
+        echo "Last 5 runs:"
+        tail -5 "${SKILLRUNNER_HOME}/logs/runs.jsonl" | \
+            jq -r '"  \(.started_at) | \(.name) | \(.status) | \(.duration_seconds)s | $\(.cost_usd)"'
+    fi
+}
+
+cmd_list() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No schedules configured."
+        exit 0
+    fi
+    jq -r '.schedules[] |
+        "\(.id)\t\(.type // "skill")\t\(.skill // .command // "")\t\(.cron)\t\(.human_schedule // "")\t\(.enabled)\t\(.project_path)"
+    ' "$CONFIG_FILE" | column -t -s $'\t' -N "ID,Type,Name,Cron,Schedule,Enabled,Project"
+}
+
+case "${1:-help}" in
+    register)   cmd_register "${2:-}" ;;
+    unregister) cmd_unregister "${2:-}" ;;
+    status)     cmd_status ;;
+    list)       cmd_list ;;
+    *)
+        echo "Usage: skillrunner-ctl {register|unregister|status|list} [path]"
+        exit 1
+        ;;
+esac

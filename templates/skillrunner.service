@@ -1,0 +1,10 @@
+[Unit]
+Description=SkillRunner — scheduled Claude Code skill executor
+
+[Service]
+Type=oneshot
+ExecStart=%h/.nix-profile/bin/skillrunner-daemon
+Nice=10
+
+[Install]
+WantedBy=default.target

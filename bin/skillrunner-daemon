@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# SkillRunner Daemon — Wakes every 60s via systemd timer or LaunchAgent.
+
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
+CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
+STATE_FILE="${SKILLRUNNER_HOME}/state.json"
+LOCKS_DIR="${SKILLRUNNER_HOME}/locks"
+OUTPUT_DIR="${SKILLRUNNER_HOME}/logs/output"
+
+# Library path set by Nix wrapper, fallback for dev
+SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
+
+source "${SKILLRUNNER_LIB}/schedule.sh"
+source "${SKILLRUNNER_LIB}/logging.sh"
+source "${SKILLRUNNER_LIB}/cron-parse.sh"
+source "${SKILLRUNNER_LIB}/lock.sh"
+
+# Disk space check (100MB minimum)
+available_kb=$(df -k "$SKILLRUNNER_HOME" | awk 'NR==2 {print $4}')
+if (( available_kb < 102400 )); then
+    log_daemon "WARNING: Low disk space (${available_kb}KB), skipping runs"
+    exit 0
+fi
+
+# Verify claude is available
+if ! command -v claude &>/dev/null; then
+    log_daemon "ERROR: claude CLI not found on PATH"
+    exit 1
+fi
+
+# Update state
+update_state() {
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local tmp
+    tmp=$(mktemp)
+    jq --arg ts "$now_iso" '.last_wake = $ts | .pid = '$$'' \
+        "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+log_daemon "Daemon woke up (pid $$)"
+update_state
+
+# Bail if config doesn't exist
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    log_daemon "No config file found, exiting"
+    exit 0
+fi
+
+# Sync registered projects: re-read each project's .skillrunner.json
+# to pick up changes made via git pull, etc.
+sync_projects
+
+# Check each schedule
+schedule_count=$(jq '.schedules | length' "$CONFIG_FILE")
+
+for ((i = 0; i < schedule_count; i++)); do
+    schedule_json=$(jq -c ".schedules[$i]" "$CONFIG_FILE")
+
+    enabled=$(echo "$schedule_json" | jq -r '.enabled')
+    [[ "$enabled" != "true" ]] && continue
+
+    cron_expr=$(echo "$schedule_json" | jq -r '.cron')
+    schedule_id=$(echo "$schedule_json" | jq -r '.id')
+    schedule_name=$(echo "$schedule_json" | jq -r '.skill // .command // "unknown"')
+
+    if cron_matches_now "$cron_expr"; then
+        log_daemon "Schedule ${schedule_id} (${schedule_name}) is due, dispatching"
+
+        if is_locked "$schedule_id"; then
+            log_daemon "Schedule ${schedule_id} is already running, skipping"
+            continue
+        fi
+
+        # Run in background so we can process other schedules concurrently
+        "$(dirname "$0")/skillrunner-run" "$schedule_id" &
+    fi
+done
+
+# Rotate runs.jsonl if it exceeds size limit
+rotate_runs_log
+
+# Periodic cleanup: remove output files older than 30 days (check once per hour at minute 0)
+if [[ "$(date +%-M)" == "0" ]]; then
+    find "${OUTPUT_DIR}" -name "*.stdout" -mtime +30 -delete 2>/dev/null || true
+    find "${OUTPUT_DIR}" -name "*.stderr" -mtime +30 -delete 2>/dev/null || true
+fi
+
+log_daemon "Daemon check complete"
