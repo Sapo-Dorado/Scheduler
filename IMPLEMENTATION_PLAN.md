@@ -2,7 +2,14 @@
 
 ## Project Overview
 
-SkillRunner is a Claude Code skill (`/schedule`) and companion daemon that automatically executes Claude Code skills on a configurable schedule. It is "cron for Claude skills" -- users define schedules like "run `/concert-search` every day at 9 AM" and SkillRunner handles invocation, logging, error handling, and lifecycle management via a macOS LaunchAgent.
+SkillRunner is a cross-platform, Nix-packaged daemon and Claude Code skill (`/schedule`) that automatically executes Claude Code skills **or bash commands** on a configurable schedule. It is "cron for Claude skills and scripts" — users define schedules like "run `/concert-search` every day at 9 AM" or "run `./scripts/backup.sh` every 6 hours" and SkillRunner handles invocation, logging, error handling, and lifecycle management.
+
+**Key design principles:**
+- **Nix-first:** Packaged as a Nix flake with pinned dependencies. No "hope jq is installed" — everything is in the closure.
+- **Cross-platform:** Works on NixOS (systemd user service), macOS (LaunchAgent), and generic Linux (systemd user service).
+- **Per-project schedules:** Each git repo can define a `.skillrunner.json` with its own schedules, registered with the global daemon. The project config is version-controlled; runtime state is not.
+- **Home-Manager integration:** Ships a home-manager module that can be imported into an existing flake to install the daemon, the skill symlink, and the service — declaratively.
+- **Telegram notifications:** Per-schedule notification config with two modes: `template` (instant, no extra cost) or `summary` (Claude generates a phone-friendly message from the skill output). Notifications can target different Telegram chats/groups per schedule.
 
 ---
 
@@ -13,32 +20,37 @@ SkillRunner is a Claude Code skill (`/schedule`) and companion daemon that autom
 │                          SkillRunner System                             │
 │                                                                         │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │  Claude Code Skill: /schedule                                    │   │
-│  │  add | list | remove | logs | status | enable | disable          │   │
+│  │  Claude Code Skills: /schedule, /schedule-setup                   │   │
+│  │  /schedule: add | list | remove | logs | status | enable         │   │
+│  │             disable | register | unregister | notify-setup        │   │
+│  │  /schedule-setup: guided project setup wizard                    │   │
 │  │  (Interactive management via Claude Code sessions)               │   │
 │  └──────────────┬───────────────────────────────────────────────────┘   │
 │                  │ reads/writes                                          │
 │                  ▼                                                       │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │  ~/.skillrunner/                                                  │   │
-│  │  ├── config.json          (schedule definitions)                  │   │
-│  │  ├── state.json           (daemon state, lock info)               │   │
-│  │  ├── logs/                                                        │   │
-│  │  │   ├── runs.jsonl       (structured execution log)              │   │
-│  │  │   ├── runner.log       (human-readable daemon log)             │   │
-│  │  │   └── output/          (captured stdout/stderr per run)        │   │
-│  │  │       └── {run_id}.txt                                         │   │
-│  │  └── locks/               (per-skill lock files)                  │   │
+│  │  ~/.config/skillrunner/                                          │   │
+│  │  ├── config.json          (global schedule registry)             │   │
+│  │  ├── state.json           (daemon state)                         │   │
+│  │  ├── logs/                                                       │   │
+│  │  │   ├── runs.jsonl       (structured execution log)             │   │
+│  │  │   ├── runner.log       (daemon lifecycle log)                 │   │
+│  │  │   └── output/          (captured stdout/stderr per run)       │   │
+│  │  │       └── {run_id}.txt                                        │   │
+│  │  └── locks/               (per-skill lock files via mkdir)       │   │
 │  └──────────────┬───────────────────────────────────────────────────┘   │
 │                  │ reads                                                 │
 │                  ▼                                                       │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │  skillrunner-daemon (Bash script)                                │   │
-│  │  - Managed by macOS LaunchAgent                                  │   │
+│  │  skillrunner-daemon (Bash 5.x, Nix-wrapped)                     │   │
+│  │  - Managed by systemd user unit (Linux/NixOS)                   │   │
+│  │    or macOS LaunchAgent                                          │   │
 │  │  - Wakes every 60s, checks schedule                              │   │
-│  │  - Invokes: claude -p --print "/<skill> <args>"                  │   │
+│  │  - Skills: invokes claude -p "/<skill> <args>"                   │   │
+│  │  - Commands: invokes bash -c "<command>"                         │   │
 │  │  - Captures output, writes logs                                  │   │
 │  │  - Handles timeouts, overlaps, retries                           │   │
+│  │  - Sends Telegram notifications after runs                       │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
 │                  │ invokes                                               │
 │                  ▼                                                       │
@@ -48,59 +60,37 @@ SkillRunner is a Claude Code skill (`/schedule`) and companion daemon that autom
 │  │                                                                   │   │
 │  │  Non-interactive execution of any Claude Code skill               │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
+│                  │ on completion (if notification configured)            │
+│                  ▼                                                       │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  Notification Dispatch                                           │   │
+│  │  - Evaluate "when" condition (always / on_failure / on_result)   │   │
+│  │  - "template" mode: expand template string, curl Telegram API    │   │
+│  │  - "summary" mode: second claude -p call to generate summary,    │   │
+│  │    then curl Telegram API                                        │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
+
+Per-project config (version controlled):
+
+  my-project/
+  ├── .skillrunner.json     ← schedule definitions for this project
+  └── .claude/skills/...    ← the skills themselves
+
+Global config (runtime state, NOT version controlled):
+
+  ~/.config/skillrunner/
+  ├── config.json           ← merged registry of all project schedules
+  └── ...
 ```
 
 ---
 
 ## How Claude Code Is Invoked Programmatically
 
-### Confirmed CLI Behavior (v2.1.76)
+### Confirmed CLI Behavior
 
-The `claude` CLI at `/Users/nicholas/.nix-profile/bin/claude` supports non-interactive execution via the `-p` / `--print` flag. Key findings from testing:
-
-**Basic non-interactive invocation:**
-```bash
-claude -p "your prompt here"
-```
-This sends the prompt, prints the response to stdout, and exits. No interactive session is created.
-
-**JSON output mode (essential for structured log capture):**
-```bash
-claude -p --output-format json "your prompt here"
-```
-Returns a JSON object with fields:
-- `result` -- the text response
-- `is_error` -- boolean
-- `duration_ms` -- wall clock time
-- `duration_api_ms` -- API time
-- `total_cost_usd` -- cost of the run
-- `stop_reason` -- why it stopped
-- `session_id` -- UUID of the session
-- `usage` -- token breakdown
-- `permission_denials` -- array of denied tool uses
-
-**Running a skill (slash command):**
-```bash
-claude -p "/<skill-name> <arguments>"
-```
-When Claude receives a prompt starting with `/`, it loads the matching skill from `~/.claude/skills/` (or project `.claude/skills/`). The skill's SKILL.md frontmatter controls which tools are available.
-
-**Permission handling for unattended execution:**
-```bash
-claude -p --permission-mode plan "/<skill-name>"
-```
-The `plan` mode allows Claude to read and search but blocks writes/edits, making it safe for autonomous runs. For skills that need to write files:
-```bash
-claude -p --dangerously-skip-permissions "/<skill-name>"
-```
-This bypasses all permission checks. Only use this in controlled environments.
-
-A safer middle ground:
-```bash
-claude -p --permission-mode acceptEdits "/<skill-name>"
-```
-Auto-accepts file edits but still prompts for bash commands (which won't work in `-p` mode, so those would be denied).
+The `claude` CLI supports non-interactive execution via the `-p` / `--print` flag.
 
 **Recommended invocation for SkillRunner daemon:**
 ```bash
@@ -112,41 +102,49 @@ claude -p \
   "/<skill-name> <args>"
 ```
 
-Flags explained:
-- `--output-format json` -- structured output for log parsing
-- `--permission-mode plan` -- safe default (overridable per schedule)
-- `--max-budget-usd 0.50` -- cost cap per run (overridable per schedule)
-- `--no-session-persistence` -- don't pollute the user's session history with daemon runs
+Flags:
+- `--output-format json` — returns structured JSON with `result`, `is_error`, `duration_ms`, `total_cost_usd`, `usage`, etc.
+- `--permission-mode plan` — safe default: read/search allowed, writes blocked. Other options: `acceptEdits`, `bypassPermissions`, `default`, `dontAsk`, `auto`.
+- `--max-budget-usd 0.50` — hard cost cap per run (overridable per schedule).
+- `--no-session-persistence` — don't save to session history.
 
-**Working directory matters:** Claude Code skills that use tools (Bash, Read, etc.) operate relative to the cwd. The daemon must `cd` to the correct directory before invoking claude, or use `--add-dir`.
+**Working directory matters:** Claude Code skills operate relative to cwd. The daemon must `cd` to the project's working directory before invoking claude.
 
 ---
 
 ## File Layout
 
+### Project Repository (this repo, version controlled)
+
 ```
 /Users/nicholas/Documents/Tools/SkillRunner/
 ├── IMPLEMENTATION_PLAN.md          (this file)
-├── SKILL.md                        (Claude Code skill definition)
+├── flake.nix                       (Nix flake: package + home-manager module)
+├── flake.lock
+├── SKILL.md                        (Claude Code /schedule skill)
+├── SETUP_SKILL.md                  (Claude Code /schedule-setup skill)
 ├── bin/
 │   ├── skillrunner-daemon          (main daemon loop script)
 │   ├── skillrunner-run             (single-run executor)
-│   └── skillrunner-ctl             (CLI for install/uninstall/status)
+│   └── skillrunner-ctl             (CLI: register/unregister/status)
 ├── lib/
 │   ├── schedule.sh                 (schedule parsing functions)
 │   ├── logging.sh                  (log writing functions)
 │   ├── cron-parse.sh               (cron expression evaluator)
-│   └── lock.sh                     (file-based locking)
-├── templates/
-│   └── com.skillrunner.daemon.plist (LaunchAgent template)
-└── install.sh                      (one-shot installer)
+│   ├── lock.sh                     (directory-based atomic locking)
+│   └── notify.sh                   (Telegram notification dispatch)
+├── module/
+│   └── home-manager.nix            (home-manager module)
+└── templates/
+    ├── com.skillrunner.daemon.plist (macOS LaunchAgent template)
+    └── skillrunner.service          (systemd user unit template)
 ```
 
-**Runtime data directory:** `~/.skillrunner/`
+### Runtime Data (`~/.config/skillrunner/`, NOT version controlled)
 
 ```
-~/.skillrunner/
-├── config.json              (all schedule definitions)
+~/.config/skillrunner/
+├── config.json              (merged registry of all schedules)
 ├── state.json               (daemon state: pid, last wake, version)
 ├── logs/
 │   ├── runs.jsonl           (append-only structured run log)
@@ -155,110 +153,34 @@ Flags explained:
 │       ├── {uuid}.stdout    (captured stdout per run)
 │       └── {uuid}.stderr    (captured stderr per run)
 └── locks/
-    └── {schedule_id}.lock   (prevents overlapping runs)
+    └── {schedule_id}/       (lock dirs, not files — atomic mkdir)
 ```
 
-**Skill symlink:** After installation, a symlink is created:
+Uses `~/.config/skillrunner/` (XDG-compliant) instead of `~/.skillrunner/`.
+
+### Per-Project Config (version controlled, lives in any git repo)
+
 ```
-~/.claude/skills/schedule -> /Users/nicholas/Documents/Tools/SkillRunner
-```
-This makes `/schedule` available in all Claude Code sessions.
-
----
-
-## Skill Definition (`SKILL.md`)
-
-```markdown
----
-name: schedule
-description: >
-  Manage scheduled automatic execution of Claude Code skills.
-  Add, remove, list, and monitor skill schedules that run via
-  a background daemon. View execution logs and daemon status.
-user-invocable: true
-argument-hint: "add|list|remove|logs|status|enable|disable"
-allowed-tools: Read, Bash, Glob, Grep
----
-
-# SkillRunner — Scheduled Skill Execution
-
-You are managing scheduled automatic execution of Claude Code skills. The user
-wants to set up skills to run on a recurring schedule (like cron) via a
-background daemon.
-
-## Data Locations
-
-- Schedule config: `~/.skillrunner/config.json`
-- Run logs: `~/.skillrunner/logs/runs.jsonl`
-- Daemon log: `~/.skillrunner/logs/runner.log`
-- Daemon state: `~/.skillrunner/state.json`
-- LaunchAgent: `~/Library/LaunchAgents/com.skillrunner.daemon.plist`
-
-## Commands
-
-### /schedule add
-Prompt the user for:
-1. **Skill name** — which slash command to run (e.g., `concert-search`)
-2. **Schedule** — cron expression or natural language ("daily at 9am", "every 6 hours", "weekdays at 8:30am")
-3. **Arguments** (optional) — arguments to pass to the skill
-4. **Working directory** (optional) — directory to run in (defaults to $HOME)
-5. **Permission mode** (optional) — `plan` (default, read-only), `acceptEdits`, or `dangerouslySkipPermissions`
-6. **Budget per run** (optional) — max USD per execution (default: $0.50)
-7. **Timeout** (optional) — max seconds per execution (default: 300)
-8. **Enabled** (optional) — whether to enable immediately (default: true)
-
-Convert natural language schedules to cron expressions. Write the entry to
-`~/.skillrunner/config.json`. Verify the skill exists in `~/.claude/skills/`.
-
-### /schedule list
-Read `~/.skillrunner/config.json` and display all schedules in a table:
-| ID | Skill | Schedule (cron) | Human Schedule | Next Run | Enabled | Last Result |
-Compute "Next Run" from the cron expression and current time. Pull "Last Result"
-from `~/.skillrunner/logs/runs.jsonl`.
-
-### /schedule remove
-Show the list, ask the user which to remove (by ID or skill name). Remove from
-config.json.
-
-### /schedule logs [--skill NAME] [--status success|failure] [--last N]
-Read `~/.skillrunner/logs/runs.jsonl` and filter/display. Default: show last 10
-runs. For each run show: timestamp, skill, duration, exit code, cost, truncated
-output (first 5 lines).
-
-### /schedule status
-Show:
-- Daemon running? (check LaunchAgent status via `launchctl list | grep skillrunner`)
-- Last daemon wake time (from state.json)
-- Number of scheduled skills (from config.json)
-- Next upcoming run across all schedules
-- Recent errors (last 3 failures from runs.jsonl)
-
-### /schedule enable / /schedule disable
-Toggle the `enabled` field on a specific schedule entry.
-
-## Installation Check
-Before any command, verify the daemon is installed:
-1. Check if `~/Library/LaunchAgents/com.skillrunner.daemon.plist` exists
-2. Check if `~/.skillrunner/` directory exists
-3. If not installed, offer to run the installer:
-   `bash /Users/nicholas/Documents/Tools/SkillRunner/install.sh`
+my-project/
+└── .skillrunner.json
 ```
 
 ---
 
-## Schedule Configuration Format (`config.json`)
+## Per-Project Schedule Config (`.skillrunner.json`)
+
+This file lives in a project's git root and defines schedules for that project. It is version-controlled so anyone who clones the repo gets the same schedule definitions.
 
 ```json
 {
   "version": 1,
   "schedules": [
     {
-      "id": "a1b2c3d4",
+      "type": "skill",
       "skill": "concert-search",
       "args": "",
       "cron": "0 9 * * *",
       "human_schedule": "Daily at 9:00 AM",
-      "working_directory": "/Users/nicholas/Documents/Tools/ConcertAgent",
       "permission_mode": "plan",
       "max_budget_usd": 0.50,
       "timeout_seconds": 300,
@@ -267,44 +189,391 @@ Before any command, verify the daemon is installed:
         "max_attempts": 1,
         "delay_seconds": 60
       },
-      "created_at": "2026-03-29T10:00:00Z",
-      "updated_at": "2026-03-29T10:00:00Z"
+      "notification": {
+        "chat_id": "-100123456789",
+        "when": "on_result",
+        "mode": "summary",
+        "summary_prompt": "Summarize what concerts were found, include dates and venues"
+      }
     },
     {
-      "id": "e5f6g7h8",
-      "skill": "nix-flakes",
-      "args": "check for outdated flake inputs",
-      "cron": "0 8 * * 1",
-      "human_schedule": "Every Monday at 8:00 AM",
-      "working_directory": "/Users/nicholas/Projects/my-app",
+      "type": "command",
+      "command": "./scripts/backup.sh",
+      "cron": "0 */6 * * *",
+      "human_schedule": "Every 6 hours",
+      "timeout_seconds": 600,
+      "enabled": true,
+      "retry": {
+        "max_attempts": 3,
+        "delay_seconds": 120
+      },
+      "notification": {
+        "chat_id": "987654321",
+        "when": "on_failure",
+        "mode": "template",
+        "template": "❌ Backup failed (exit ${exit_code}, attempt ${attempts}/${max_attempts})"
+      }
+    },
+    {
+      "type": "skill",
+      "skill": "backup-verify",
+      "args": "",
+      "cron": "0 6 * * *",
+      "human_schedule": "Daily at 6:00 AM",
       "permission_mode": "plan",
       "max_budget_usd": 0.25,
       "timeout_seconds": 120,
       "enabled": true,
       "retry": {
         "max_attempts": 2,
-        "delay_seconds": 120
+        "delay_seconds": 60
       },
-      "created_at": "2026-03-29T10:30:00Z",
-      "updated_at": "2026-03-29T10:30:00Z"
+      "notification": {
+        "chat_id": "987654321",
+        "when": "on_failure",
+        "mode": "template"
+      }
     }
   ]
 }
 ```
 
-**ID generation:** 8-character hex from `openssl rand -hex 4`.
+### Schedule Types
 
-**Cron expression format:** Standard 5-field cron: `minute hour day_of_month month day_of_week`. No seconds field.
+Each schedule has a `type` field that determines how it is executed:
 
-**Natural language to cron mapping (handled by the skill via Claude):**
-| Natural Language | Cron |
-|---|---|
-| daily at 9am | `0 9 * * *` |
-| every 6 hours | `0 */6 * * *` |
-| weekdays at 8:30am | `30 8 * * 1-5` |
-| every monday at noon | `0 12 * * 1` |
-| every 30 minutes | `*/30 * * * *` |
-| first of every month at 6am | `0 6 1 * *` |
+**`"type": "skill"`** — Invokes a Claude Code skill via `claude -p "/<skill> <args>"`.
+- Requires: `skill` (name of the slash command)
+- Optional: `args`, `permission_mode`, `max_budget_usd`
+- Output: Claude's JSON response (parsed for cost, result, is_error)
+- Use when: the task requires AI reasoning, reading/analyzing code, generating content, or interacting with tools
+
+**`"type": "command"`** — Runs a bash command directly, no Claude involved.
+- Requires: `command` (the command string to execute via `bash -c`)
+- No `skill`, `args`, `permission_mode`, or `max_budget_usd` fields
+- Output: raw stdout/stderr captured to log files
+- Use when: the task is deterministic and doesn't need AI — running a script, checking disk space, pulling git updates, pinging a service, etc.
+- The command runs from the project's working directory
+- **Cost: $0** — no API calls
+
+If `type` is omitted, it defaults to `"skill"` for backwards compatibility.
+
+Note: **no `id`, no `working_directory`** — these are assigned at registration time. The working directory is the project root where `.skillrunner.json` lives. IDs are generated when registering.
+
+### Notification Schema
+
+The `notification` field is optional. If omitted, no notification is sent.
+
+```json
+"notification": {
+  "chat_id": "string (required)",
+  "when": "always | on_failure | on_result",
+  "mode": "template | summary",
+  "template": "optional custom template string (template mode only)",
+  "summary_prompt": "required prompt string (summary mode only)"
+}
+```
+
+**`chat_id`** — Telegram chat to send to:
+- Positive number (e.g., `"987654321"`) = DM to one person
+- Negative number (e.g., `"-100123456789"`) = group chat (anyone in the group sees it)
+- To get a personal chat_id: message the bot, then check `https://api.telegram.org/bot<TOKEN>/getUpdates`
+- To get a group chat_id: add the bot to a group, send a message, check getUpdates
+
+**`when`** — when to send:
+- `"always"` — after every run regardless of outcome
+- `"on_failure"` — only when the run fails (non-zero exit, or `is_error: true` for skills)
+- `"on_result"` — only when the run produces non-empty output
+
+**`mode`** — how to generate the message:
+- `"template"` — no Claude call. Expands a template string with run variables. If `template` is omitted, uses a default: `"[status_emoji] *skill* status (duration, $cost)"`
+- `"summary"` — second Claude call (`--max-budget-usd 0.05`) with `summary_prompt` to generate a phone-friendly message from the full skill output
+
+**`template`** variables (for template mode):
+- `${name}` — skill name or command
+- `${status}` — success / failure
+- `${exit_code}` — exit code
+- `${duration}` — seconds
+- `${cost}` — USD amount
+- `${attempts}` — attempt count
+- `${max_attempts}` — max attempts configured
+- `${project_path}` — working directory
+- `${result_preview}` — first 500 chars of output
+- `${timestamp}` — ISO timestamp
+
+Example custom template:
+```json
+"template": "*${skill}* failed in ${project_path}\nExit: ${exit_code} | Attempts: ${attempts}/${max_attempts}"
+```
+
+### Telegram Bot Token
+
+The bot token is stored globally, NOT in `.skillrunner.json` (which is version-controlled). It lives in:
+
+```
+~/.config/skillrunner/secrets.env
+```
+
+Contents:
+```
+SKILLRUNNER_TELEGRAM_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+```
+
+The daemon sources this file before dispatching notifications. The home-manager module creates this file (empty) during activation if it doesn't exist.
+
+### Global Registry (`~/.config/skillrunner/config.json`)
+
+The daemon reads this file. It is the merged view of all registered projects:
+
+```json
+{
+  "version": 1,
+  "projects": [
+    {
+      "path": "/home/nicholas/Projects/ConcertAgent",
+      "registered_at": "2026-03-29T10:00:00Z"
+    }
+  ],
+  "schedules": [
+    {
+      "id": "a1b2c3d4",
+      "type": "skill",
+      "project_path": "/home/nicholas/Projects/ConcertAgent",
+      "skill": "concert-search",
+      "args": "",
+      "cron": "0 9 * * *",
+      "human_schedule": "Daily at 9:00 AM",
+      "permission_mode": "plan",
+      "max_budget_usd": 0.50,
+      "timeout_seconds": 300,
+      "enabled": true,
+      "retry": {
+        "max_attempts": 1,
+        "delay_seconds": 60
+      },
+      "notification": {
+        "chat_id": "-100123456789",
+        "when": "on_result",
+        "mode": "summary",
+        "summary_prompt": "Summarize what concerts were found, include dates and venues"
+      },
+      "registered_at": "2026-03-29T10:00:00Z"
+    },
+    {
+      "id": "b2c3d4e5",
+      "type": "command",
+      "project_path": "/home/nicholas/Projects/ConcertAgent",
+      "command": "./scripts/backup.sh",
+      "cron": "0 */6 * * *",
+      "human_schedule": "Every 6 hours",
+      "timeout_seconds": 600,
+      "enabled": true,
+      "retry": {
+        "max_attempts": 3,
+        "delay_seconds": 120
+      },
+      "notification": {
+        "chat_id": "987654321",
+        "when": "on_failure",
+        "mode": "template"
+      },
+      "registered_at": "2026-03-29T10:00:00Z"
+    }
+  ]
+}
+```
+
+### Registration Flow
+
+1. User runs `/schedule register` in a project directory (or `skillrunner-ctl register /path/to/project`)
+2. SkillRunner reads `.skillrunner.json` from that directory
+3. Each schedule entry gets an `id` (8-char hex) and `project_path` assigned
+4. Entries are merged into the global `config.json`
+5. `/schedule unregister` removes all schedules for a project path
+
+This means: clone a repo, run `/schedule register`, done. The schedules are defined by the project author, not typed in manually each time.
+
+---
+
+## Nix Flake (`flake.nix`)
+
+```nix
+{
+  description = "SkillRunner — cron for Claude Code skills";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
+  outputs = { self, nixpkgs }:
+    let
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+    in {
+
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.stdenv.mkDerivation {
+            pname = "skillrunner";
+            version = "0.1.0";
+            src = ./.;
+
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            buildInputs = [ pkgs.bash pkgs.jq pkgs.coreutils pkgs.openssl pkgs.curl ];
+
+            installPhase = ''
+              mkdir -p $out/bin $out/lib $out/share/skillrunner
+
+              # Install library files
+              cp lib/*.sh $out/lib/
+
+              # Install and wrap bin scripts
+              for script in bin/*; do
+                install -m755 "$script" "$out/bin/$(basename $script)"
+                wrapProgram "$out/bin/$(basename $script)" \
+                  --set SKILLRUNNER_LIB "$out/lib" \
+                  --prefix PATH : "${pkgs.lib.makeBinPath [
+                    pkgs.bash pkgs.jq pkgs.coreutils pkgs.openssl pkgs.curl
+                  ]}"
+              done
+
+              # Install skill definitions
+              cp SKILL.md $out/share/skillrunner/
+              cp SETUP_SKILL.md $out/share/skillrunner/
+
+              # Install service templates
+              mkdir -p $out/share/skillrunner/templates
+              cp templates/* $out/share/skillrunner/templates/
+            '';
+          };
+        });
+
+      # Home-Manager module for declarative installation
+      homeManagerModules.default = import ./module/home-manager.nix self;
+    };
+}
+```
+
+### Home-Manager Module (`module/home-manager.nix`)
+
+This is the key integration point with your existing NixOS flake. It:
+- Installs the skillrunner package
+- Creates the `~/.claude/skills/schedule` symlink
+- Sets up the systemd user service (Linux) or LaunchAgent (macOS)
+- Creates the runtime directory structure
+
+```nix
+skillrunner: { config, lib, pkgs, ... }:
+
+let
+  cfg = config.services.skillrunner;
+  package = skillrunner.packages.${pkgs.system}.default;
+  isLinux = pkgs.stdenv.isLinux;
+  isDarwin = pkgs.stdenv.isDarwin;
+in {
+  options.services.skillrunner = {
+    enable = lib.mkEnableOption "SkillRunner daemon for scheduled Claude Code skills";
+  };
+
+  config = lib.mkIf cfg.enable {
+
+    home.packages = [ package ];
+
+    # Symlink skills into Claude Code's skill directory
+    home.file.".claude/skills/schedule/SKILL.md".source =
+      "${package}/share/skillrunner/SKILL.md";
+    home.file.".claude/skills/schedule-setup/SKILL.md".source =
+      "${package}/share/skillrunner/SETUP_SKILL.md";
+
+    # Create runtime directories via activation script
+    home.activation.skillrunner-dirs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      mkdir -p "${config.home.homeDirectory}/.config/skillrunner"/{logs/output,locks}
+      if [ ! -f "${config.home.homeDirectory}/.config/skillrunner/config.json" ]; then
+        echo '{"version": 1, "projects": [], "schedules": []}' > \
+          "${config.home.homeDirectory}/.config/skillrunner/config.json"
+      fi
+      echo '{"last_wake": null, "pid": null, "version": 1}' > \
+        "${config.home.homeDirectory}/.config/skillrunner/state.json"
+      # Create secrets file (for Telegram token) if it doesn't exist
+      if [ ! -f "${config.home.homeDirectory}/.config/skillrunner/secrets.env" ]; then
+        echo '# Add your Telegram bot token here:' > \
+          "${config.home.homeDirectory}/.config/skillrunner/secrets.env"
+        echo '# SKILLRUNNER_TELEGRAM_TOKEN=your_bot_token_here' >> \
+          "${config.home.homeDirectory}/.config/skillrunner/secrets.env"
+        chmod 600 "${config.home.homeDirectory}/.config/skillrunner/secrets.env"
+      fi
+    '';
+
+    # Systemd user service (NixOS / Linux)
+    systemd.user.services.skillrunner = lib.mkIf isLinux {
+      Unit = {
+        Description = "SkillRunner — scheduled Claude Code skill executor";
+      };
+      Service = {
+        Type = "oneshot";
+        ExecStart = "${package}/bin/skillrunner-daemon";
+        Nice = 10;
+      };
+    };
+
+    systemd.user.timers.skillrunner = lib.mkIf isLinux {
+      Unit = {
+        Description = "SkillRunner wake timer";
+      };
+      Timer = {
+        OnBootSec = "1min";
+        OnUnitActiveSec = "1min";
+        Persistent = true;   # catch up after sleep/reboot
+      };
+      Install = {
+        WantedBy = [ "timers.target" ];
+      };
+    };
+
+    # macOS LaunchAgent
+    launchd.agents.skillrunner = lib.mkIf isDarwin {
+      enable = true;
+      config = {
+        Label = "com.skillrunner.daemon";
+        ProgramArguments = [ "${package}/bin/skillrunner-daemon" ];
+        StartInterval = 60;
+        RunAtLoad = true;
+        StandardOutPath =
+          "${config.home.homeDirectory}/.config/skillrunner/logs/launchd-stdout.log";
+        StandardErrorPath =
+          "${config.home.homeDirectory}/.config/skillrunner/logs/launchd-stderr.log";
+        Nice = 10;
+        ProcessType = "Background";
+      };
+    };
+  };
+}
+```
+
+### Integration with Your NixOS Flake
+
+In your `nixosFlake/flake.nix`, add SkillRunner as an input and import the module:
+
+```nix
+# In flake.nix inputs:
+inputs.skillrunner.url = "github:Sapo-Dorado/SkillRunner";  # or path
+inputs.skillrunner.inputs.nixpkgs.follows = "nixpkgs";
+
+# In home-manager modules or extraSpecialArgs, pass skillrunner through,
+# then in a home .nix file:
+{ skillrunner, ... }: {
+  imports = [ skillrunner.homeManagerModules.default ];
+  services.skillrunner.enable = true;
+}
+```
+
+This gives you:
+- `skillrunner-daemon`, `skillrunner-run`, `skillrunner-ctl` on PATH
+- The `/schedule` skill available in all Claude Code sessions
+- A systemd user timer on NixOS (or LaunchAgent on Mac) running automatically
+- No manual install step — `nixos-rebuild switch` or `home-manager switch` does it all
 
 ---
 
@@ -312,60 +581,7 @@ Before any command, verify the daemon is installed:
 
 ### Overview
 
-The daemon is a bash script that runs as a macOS LaunchAgent. It is designed as a "wake and check" loop: launchd wakes it every 60 seconds, it checks which schedules are due, runs them, and exits. This is simpler and more reliable than a long-running process.
-
-### LaunchAgent plist (`com.skillrunner.daemon.plist`)
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.skillrunner.daemon</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>/Users/nicholas/Documents/Tools/SkillRunner/bin/skillrunner-daemon</string>
-    </array>
-
-    <key>StartInterval</key>
-    <integer>60</integer>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>StandardOutPath</key>
-    <string>/Users/nicholas/.skillrunner/logs/launchd-stdout.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/nicholas/.skillrunner/logs/launchd-stderr.log</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/Users/nicholas/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HOME</key>
-        <string>/Users/nicholas</string>
-    </dict>
-
-    <key>Nice</key>
-    <integer>10</integer>
-
-    <key>ProcessType</key>
-    <string>Background</string>
-</dict>
-</plist>
-```
-
-**Key design choices:**
-- `StartInterval` of 60 seconds: the daemon wakes once per minute, matching cron's minimum granularity. This is lightweight -- the script checks timestamps and exits immediately if nothing is due.
-- `RunAtLoad: true`: starts on login.
-- `Nice: 10`: lower priority so it doesn't compete with interactive work.
-- `ProcessType: Background`: tells macOS this is a background task, eligible for power nap.
-- PATH includes nix-profile so `claude` is found.
+The daemon is a bash 5.x script that runs as a oneshot service, triggered every 60 seconds by either a systemd timer or macOS LaunchAgent `StartInterval`. It checks which schedules are due, runs them, and exits. No long-running process.
 
 ### Daemon Script (`bin/skillrunner-daemon`)
 
@@ -373,51 +589,59 @@ The daemon is a bash script that runs as a macOS LaunchAgent. It is designed as 
 #!/usr/bin/env bash
 set -euo pipefail
 
-# SkillRunner Daemon - Wakes every 60s via LaunchAgent, runs due schedules.
+# SkillRunner Daemon — Wakes every 60s via systemd timer or LaunchAgent.
 
-SKILLRUNNER_HOME="${HOME}/.skillrunner"
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
 CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
 STATE_FILE="${SKILLRUNNER_HOME}/state.json"
-LOG_FILE="${SKILLRUNNER_HOME}/logs/runner.log"
-RUNS_LOG="${SKILLRUNNER_HOME}/logs/runs.jsonl"
 LOCKS_DIR="${SKILLRUNNER_HOME}/locks"
 OUTPUT_DIR="${SKILLRUNNER_HOME}/logs/output"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Source library functions
-source "${SCRIPT_DIR}/../lib/schedule.sh"
-source "${SCRIPT_DIR}/../lib/logging.sh"
-source "${SCRIPT_DIR}/../lib/cron-parse.sh"
-source "${SCRIPT_DIR}/../lib/lock.sh"
+# Library path set by Nix wrapper, fallback for dev
+SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
 
-# Update state file with current wake time
+source "${SKILLRUNNER_LIB}/schedule.sh"
+source "${SKILLRUNNER_LIB}/logging.sh"
+source "${SKILLRUNNER_LIB}/cron-parse.sh"
+source "${SKILLRUNNER_LIB}/lock.sh"
+
+# Disk space check (100MB minimum)
+available_kb=$(df -k "$SKILLRUNNER_HOME" | awk 'NR==2 {print $4}')
+if (( available_kb < 102400 )); then
+    log_daemon "WARNING: Low disk space (${available_kb}KB), skipping runs"
+    exit 0
+fi
+
+# Verify claude is available
+if ! command -v claude &>/dev/null; then
+    log_daemon "ERROR: claude CLI not found on PATH"
+    exit 1
+fi
+
+# Update state
 update_state() {
     local now_iso
     now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    # Use a temp file for atomic write
     local tmp
     tmp=$(mktemp)
     jq --arg ts "$now_iso" '.last_wake = $ts | .pid = '$$'' \
         "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 }
 
-# Check if a schedule is due at the current minute
-is_due() {
-    local cron_expr="$1"
-    cron_matches_now "$cron_expr"
-}
-
-# Main
 log_daemon "Daemon woke up (pid $$)"
 update_state
 
 # Bail if config doesn't exist
 if [[ ! -f "$CONFIG_FILE" ]]; then
-    log_daemon "No config file found at ${CONFIG_FILE}, exiting"
+    log_daemon "No config file found, exiting"
     exit 0
 fi
 
-# Read schedules and check each one
+# Sync registered projects: re-read each project's .skillrunner.json
+# to pick up changes made via git pull, etc.
+sync_projects
+
+# Check each schedule
 schedule_count=$(jq '.schedules | length' "$CONFIG_FILE")
 
 for ((i = 0; i < schedule_count; i++)); do
@@ -430,19 +654,24 @@ for ((i = 0; i < schedule_count; i++)); do
     schedule_id=$(echo "$schedule_json" | jq -r '.id')
     skill=$(echo "$schedule_json" | jq -r '.skill')
 
-    if is_due "$cron_expr"; then
+    if cron_matches_now "$cron_expr"; then
         log_daemon "Schedule ${schedule_id} (${skill}) is due, dispatching"
 
-        # Check for overlap lock
         if is_locked "$schedule_id"; then
             log_daemon "Schedule ${schedule_id} is already running, skipping"
             continue
         fi
 
-        # Run in background so we can process other schedules
-        "${SCRIPT_DIR}/skillrunner-run" "$schedule_id" &
+        # Run in background so we can process other schedules concurrently
+        "$(dirname "$0")/skillrunner-run" "$schedule_id" &
     fi
 done
+
+# Periodic cleanup: remove output files older than 30 days (check once per hour at minute 0)
+if [[ "$(date +%-M)" == "0" ]]; then
+    find "${OUTPUT_DIR}" -name "*.stdout" -mtime +30 -delete 2>/dev/null || true
+    find "${OUTPUT_DIR}" -name "*.stderr" -mtime +30 -delete 2>/dev/null || true
+fi
 
 log_daemon "Daemon check complete"
 ```
@@ -456,15 +685,15 @@ set -euo pipefail
 # Executes a single scheduled skill run.
 # Usage: skillrunner-run <schedule_id>
 
-SKILLRUNNER_HOME="${HOME}/.skillrunner"
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
 CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
 RUNS_LOG="${SKILLRUNNER_HOME}/logs/runs.jsonl"
-LOCKS_DIR="${SKILLRUNNER_HOME}/locks"
 OUTPUT_DIR="${SKILLRUNNER_HOME}/logs/output"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-source "${SCRIPT_DIR}/../lib/logging.sh"
-source "${SCRIPT_DIR}/../lib/lock.sh"
+SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
+source "${SKILLRUNNER_LIB}/logging.sh"
+source "${SKILLRUNNER_LIB}/lock.sh"
+source "${SKILLRUNNER_LIB}/notify.sh"
 
 SCHEDULE_ID="$1"
 RUN_ID=$(openssl rand -hex 8)
@@ -476,29 +705,42 @@ if [[ -z "$schedule_json" ]]; then
     exit 1
 fi
 
-skill=$(echo "$schedule_json" | jq -r '.skill')
-args=$(echo "$schedule_json" | jq -r '.args // ""')
-workdir=$(echo "$schedule_json" | jq -r '.working_directory // env.HOME')
-permission_mode=$(echo "$schedule_json" | jq -r '.permission_mode // "plan"')
-max_budget=$(echo "$schedule_json" | jq -r '.max_budget_usd // 0.50')
+run_type=$(echo "$schedule_json" | jq -r '.type // "skill"')
+workdir=$(echo "$schedule_json" | jq -r '.project_path // env.HOME')
 timeout_secs=$(echo "$schedule_json" | jq -r '.timeout_seconds // 300')
 max_attempts=$(echo "$schedule_json" | jq -r '.retry.max_attempts // 1')
 retry_delay=$(echo "$schedule_json" | jq -r '.retry.delay_seconds // 60')
 
-# Acquire lock
-acquire_lock "$SCHEDULE_ID" $$ || {
+# Type-specific fields
+skill=""
+args=""
+command=""
+permission_mode="plan"
+max_budget="0.50"
+
+if [[ "$run_type" == "skill" ]]; then
+    skill=$(echo "$schedule_json" | jq -r '.skill')
+    args=$(echo "$schedule_json" | jq -r '.args // ""')
+    permission_mode=$(echo "$schedule_json" | jq -r '.permission_mode // "plan"')
+    max_budget=$(echo "$schedule_json" | jq -r '.max_budget_usd // 0.50')
+elif [[ "$run_type" == "command" ]]; then
+    command=$(echo "$schedule_json" | jq -r '.command')
+fi
+
+# Display name for logging
+run_name="${skill:-${command}}"
+
+# Acquire lock (atomic mkdir)
+acquire_lock "$SCHEDULE_ID" || {
     log_daemon "Failed to acquire lock for ${SCHEDULE_ID}"
     exit 1
 }
 trap 'release_lock "$SCHEDULE_ID"' EXIT
 
-prompt="/${skill}"
-[[ -n "$args" ]] && prompt="/${skill} ${args}"
-
 start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 start_epoch=$(date +%s)
 
-log_daemon "RUN ${RUN_ID}: Starting skill '${skill}' in ${workdir}"
+log_daemon "RUN ${RUN_ID}: Starting ${run_type} '${run_name}' in ${workdir}"
 
 attempt=0
 exit_code=1
@@ -509,20 +751,35 @@ while (( attempt < max_attempts )); do
     attempt=$((attempt + 1))
     log_daemon "RUN ${RUN_ID}: Attempt ${attempt}/${max_attempts}"
 
-    # Invoke Claude Code
     set +e
-    timeout "${timeout_secs}" \
-        /Users/nicholas/.nix-profile/bin/claude -p \
-            --output-format json \
-            --permission-mode "$permission_mode" \
-            --max-budget-usd "$max_budget" \
-            --no-session-persistence \
-            "$prompt" \
-        > "$stdout_file" 2> "$stderr_file" < /dev/null
-    exit_code=$?
+    if [[ "$run_type" == "skill" ]]; then
+        # Build skill prompt
+        local prompt="/${skill}"
+        [[ -n "$args" ]] && prompt="/${skill} ${args}"
+
+        # Invoke Claude Code from the project directory
+        (
+            cd "$workdir" 2>/dev/null || cd "$HOME"
+            timeout "${timeout_secs}" \
+                claude -p \
+                    --output-format json \
+                    --permission-mode "$permission_mode" \
+                    --max-budget-usd "$max_budget" \
+                    --no-session-persistence \
+                    "$prompt"
+        ) > "$stdout_file" 2> "$stderr_file" < /dev/null
+        exit_code=$?
+    elif [[ "$run_type" == "command" ]]; then
+        # Run bash command directly
+        (
+            cd "$workdir" 2>/dev/null || cd "$HOME"
+            timeout "${timeout_secs}" \
+                bash -c "$command"
+        ) > "$stdout_file" 2> "$stderr_file" < /dev/null
+        exit_code=$?
+    fi
     set -e
 
-    # Exit code 124 means timeout killed it
     if [[ $exit_code -eq 124 ]]; then
         log_daemon "RUN ${RUN_ID}: Timed out after ${timeout_secs}s"
     fi
@@ -541,32 +798,50 @@ end_epoch=$(date +%s)
 duration=$((end_epoch - start_epoch))
 end_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Parse cost from JSON output if available
+# Parse output based on type
 cost="null"
 result_text=""
-if [[ -f "$stdout_file" ]] && jq -e '.total_cost_usd' "$stdout_file" > /dev/null 2>&1; then
-    cost=$(jq '.total_cost_usd' "$stdout_file")
-    result_text=$(jq -r '.result // ""' "$stdout_file" | head -c 2000)
+status="success"
+
+if [[ -f "$stdout_file" ]]; then
+    if [[ "$run_type" == "skill" ]]; then
+        # Skill output is JSON from Claude
+        if jq -e '.total_cost_usd' "$stdout_file" > /dev/null 2>&1; then
+            cost=$(jq '.total_cost_usd' "$stdout_file")
+            result_text=$(jq -r '.result // ""' "$stdout_file" | head -c 2000)
+        fi
+        if jq -e '.is_error == true' "$stdout_file" > /dev/null 2>&1; then
+            status="failure"
+        fi
+    elif [[ "$run_type" == "command" ]]; then
+        # Command output is raw text
+        result_text=$(head -c 2000 "$stdout_file")
+    fi
 fi
 
-# Determine status
-status="success"
 [[ $exit_code -ne 0 ]] && status="failure"
 
-# Truncate output files if huge (> 100KB)
+# Truncate large output files (> 100KB)
 for f in "$stdout_file" "$stderr_file"; do
-    if [[ -f "$f" ]] && (( $(stat -f%z "$f" 2>/dev/null || echo 0) > 102400 )); then
-        truncate -s 102400 "$f"
-        echo -e "\n\n[TRUNCATED - output exceeded 100KB]" >> "$f"
+    if [[ -f "$f" ]]; then
+        local_size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+        if (( local_size > 102400 )); then
+            truncate -s 102400 "$f"
+            echo -e "\n\n[TRUNCATED - output exceeded 100KB]" >> "$f"
+        fi
     fi
 done
 
-# Write structured log entry
+# Write structured log entry (atomic via temp file + append)
 log_entry=$(jq -n \
     --arg run_id "$RUN_ID" \
     --arg schedule_id "$SCHEDULE_ID" \
+    --arg type "$run_type" \
+    --arg name "$run_name" \
     --arg skill "$skill" \
+    --arg command "$command" \
     --arg args "$args" \
+    --arg project_path "$workdir" \
     --arg start "$start_time" \
     --arg end "$end_time" \
     --argjson duration "$duration" \
@@ -580,8 +855,12 @@ log_entry=$(jq -n \
     '{
         run_id: $run_id,
         schedule_id: $schedule_id,
+        type: $type,
+        name: $name,
         skill: $skill,
+        command: $command,
         args: $args,
+        project_path: $project_path,
         started_at: $start,
         ended_at: $end,
         duration_seconds: $duration,
@@ -597,7 +876,22 @@ log_entry=$(jq -n \
 
 echo "$log_entry" >> "$RUNS_LOG"
 
-log_daemon "RUN ${RUN_ID}: Completed (${status}, ${duration}s, exit ${exit_code}, cost \$${cost})"
+log_daemon "RUN ${RUN_ID}: ${run_type} '${run_name}' completed (${status}, ${duration}s, exit ${exit_code}, cost \$${cost})"
+
+# --- Notification dispatch ---
+# Set notify_* variables for template expansion and dispatch
+notify_skill="$run_name"
+notify_status="$status"
+notify_exit_code="$exit_code"
+notify_duration="$duration"
+notify_cost="$cost"
+notify_attempts="$attempt"
+notify_max_attempts="$max_attempts"
+notify_project_path="$workdir"
+notify_result_preview="${result_text:0:500}"
+notify_timestamp="$end_time"
+
+dispatch_notification "$schedule_json"
 ```
 
 ### Control Script (`bin/skillrunner-ctl`)
@@ -606,93 +900,137 @@ log_daemon "RUN ${RUN_ID}: Completed (${status}, ${duration}s, exit ${exit_code}
 #!/usr/bin/env bash
 set -euo pipefail
 
-# SkillRunner control script: install, uninstall, start, stop, status
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
+CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
 
-PLIST_NAME="com.skillrunner.daemon"
-PLIST_SRC="$(cd "$(dirname "$0")/../templates" && pwd)/${PLIST_NAME}.plist"
-PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
-SKILLRUNNER_HOME="${HOME}/.skillrunner"
+SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
+source "${SKILLRUNNER_LIB}/logging.sh"
+
+ensure_config() {
+    mkdir -p "${SKILLRUNNER_HOME}"/{logs/output,locks}
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo '{"version": 1, "projects": [], "schedules": []}' | jq . > "$CONFIG_FILE"
+    fi
+    if [[ ! -f "${SKILLRUNNER_HOME}/state.json" ]]; then
+        echo '{"last_wake": null, "pid": null, "version": 1}' | jq . > "${SKILLRUNNER_HOME}/state.json"
+    fi
+}
+
+cmd_register() {
+    local project_path="${1:-.}"
+    project_path="$(cd "$project_path" && pwd)"
+
+    local project_config="${project_path}/.skillrunner.json"
+    if [[ ! -f "$project_config" ]]; then
+        echo "ERROR: No .skillrunner.json found in ${project_path}"
+        exit 1
+    fi
+
+    ensure_config
+
+    # Remove existing schedules for this project
+    local tmp
+    tmp=$(mktemp)
+    jq --arg pp "$project_path" '
+        .schedules = [.schedules[] | select(.project_path != $pp)] |
+        .projects = [.projects[] | select(.path != $pp)]
+    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+    # Read project config and merge schedules
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Add project entry
+    tmp=$(mktemp)
+    jq --arg pp "$project_path" --arg ts "$now_iso" '
+        .projects += [{"path": $pp, "registered_at": $ts}]
+    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+    # Add each schedule with generated ID
+    local count
+    count=$(jq '.schedules | length' "$project_config")
+
+    for ((i = 0; i < count; i++)); do
+        local sid
+        sid=$(openssl rand -hex 4)
+
+        tmp=$(mktemp)
+        jq --arg pp "$project_path" --arg sid "$sid" --arg ts "$now_iso" \
+            --argjson sched "$(jq -c ".schedules[$i]" "$project_config")" '
+            .schedules += [$sched + {
+                "id": $sid,
+                "project_path": $pp,
+                "registered_at": $ts
+            }]
+        ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+    done
+
+    echo "Registered ${count} schedule(s) from ${project_path}"
+}
+
+cmd_unregister() {
+    local project_path="${1:-.}"
+    project_path="$(cd "$project_path" && pwd)"
+
+    local tmp
+    tmp=$(mktemp)
+    jq --arg pp "$project_path" '
+        .schedules = [.schedules[] | select(.project_path != $pp)] |
+        .projects = [.projects[] | select(.path != $pp)]
+    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+    echo "Unregistered all schedules for ${project_path}"
+}
+
+cmd_status() {
+    echo "=== SkillRunner Status ==="
+
+    # Check daemon (systemd or launchctl)
+    if systemctl --user is-active skillrunner.timer &>/dev/null; then
+        echo "Daemon: RUNNING (systemd timer)"
+    elif launchctl list 2>/dev/null | grep -q "com.skillrunner.daemon"; then
+        echo "Daemon: RUNNING (LaunchAgent)"
+    else
+        echo "Daemon: STOPPED"
+    fi
+
+    if [[ -f "${SKILLRUNNER_HOME}/state.json" ]]; then
+        echo "Last wake: $(jq -r '.last_wake // "never"' "${SKILLRUNNER_HOME}/state.json")"
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local sched_count proj_count
+        sched_count=$(jq '.schedules | length' "$CONFIG_FILE")
+        proj_count=$(jq '.projects | length' "$CONFIG_FILE")
+        echo "Projects: ${proj_count}"
+        echo "Schedules: ${sched_count}"
+    fi
+
+    if [[ -f "${SKILLRUNNER_HOME}/logs/runs.jsonl" ]]; then
+        echo ""
+        echo "Last 5 runs:"
+        tail -5 "${SKILLRUNNER_HOME}/logs/runs.jsonl" | \
+            jq -r '"  \(.started_at) | \(.skill) | \(.status) | \(.duration_seconds)s | $\(.cost_usd)"'
+    fi
+}
+
+cmd_list() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No schedules configured."
+        exit 0
+    fi
+    jq -r '.schedules[] |
+        "\(.id)\t\(.skill)\t\(.cron)\t\(.human_schedule // "")\t\(.enabled)\t\(.project_path)"
+    ' "$CONFIG_FILE" | column -t -s $'\t' -N "ID,Skill,Cron,Schedule,Enabled,Project"
+}
 
 case "${1:-help}" in
-    install)
-        echo "Installing SkillRunner..."
-
-        # Create directory structure
-        mkdir -p "${SKILLRUNNER_HOME}"/{logs/output,locks}
-
-        # Initialize config if not present
-        if [[ ! -f "${SKILLRUNNER_HOME}/config.json" ]]; then
-            echo '{"version": 1, "schedules": []}' | jq . > "${SKILLRUNNER_HOME}/config.json"
-        fi
-
-        # Initialize state
-        echo '{"last_wake": null, "pid": null, "version": 1}' | jq . > "${SKILLRUNNER_HOME}/state.json"
-
-        # Generate plist with correct paths
-        sed "s|__USER_HOME__|${HOME}|g; s|__SKILLRUNNER_DIR__|$(cd "$(dirname "$0")/.." && pwd)|g; s|__NIX_BIN__|$(dirname "$(which claude)")|g" \
-            "$PLIST_SRC" > "$PLIST_DST"
-
-        # Install skill symlink
-        mkdir -p "${HOME}/.claude/skills"
-        SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-        ln -sfn "$SKILL_DIR" "${HOME}/.claude/skills/schedule"
-
-        # Load the LaunchAgent
-        launchctl load "$PLIST_DST" 2>/dev/null || true
-
-        echo "SkillRunner installed successfully."
-        echo "  Config: ${SKILLRUNNER_HOME}/config.json"
-        echo "  Logs:   ${SKILLRUNNER_HOME}/logs/"
-        echo "  Skill:  /schedule is now available in Claude Code"
-        ;;
-
-    uninstall)
-        echo "Uninstalling SkillRunner..."
-        launchctl unload "$PLIST_DST" 2>/dev/null || true
-        rm -f "$PLIST_DST"
-        rm -f "${HOME}/.claude/skills/schedule"
-        echo "LaunchAgent removed. Data preserved at ${SKILLRUNNER_HOME}/"
-        echo "To fully remove: rm -rf ${SKILLRUNNER_HOME}"
-        ;;
-
-    start)
-        launchctl load "$PLIST_DST"
-        echo "SkillRunner daemon started."
-        ;;
-
-    stop)
-        launchctl unload "$PLIST_DST"
-        echo "SkillRunner daemon stopped."
-        ;;
-
-    status)
-        echo "=== SkillRunner Status ==="
-        if launchctl list | grep -q "$PLIST_NAME"; then
-            echo "Daemon: RUNNING"
-        else
-            echo "Daemon: STOPPED"
-        fi
-
-        if [[ -f "${SKILLRUNNER_HOME}/state.json" ]]; then
-            echo "Last wake: $(jq -r '.last_wake // "never"' "${SKILLRUNNER_HOME}/state.json")"
-        fi
-
-        if [[ -f "${SKILLRUNNER_HOME}/config.json" ]]; then
-            local count
-            count=$(jq '.schedules | length' "${SKILLRUNNER_HOME}/config.json")
-            echo "Schedules: ${count}"
-        fi
-
-        if [[ -f "${SKILLRUNNER_HOME}/logs/runs.jsonl" ]]; then
-            echo ""
-            echo "Last 5 runs:"
-            tail -5 "${SKILLRUNNER_HOME}/logs/runs.jsonl" | \
-                jq -r '"  \(.started_at) | \(.skill) | \(.status) | \(.duration_seconds)s | $\(.cost_usd)"'
-        fi
-        ;;
-
+    register)   cmd_register "${2:-}" ;;
+    unregister) cmd_unregister "${2:-}" ;;
+    status)     cmd_status ;;
+    list)       cmd_list ;;
     *)
-        echo "Usage: skillrunner-ctl {install|uninstall|start|stop|status}"
+        echo "Usage: skillrunner-ctl {register|unregister|status|list} [path]"
         exit 1
         ;;
 esac
@@ -704,15 +1042,11 @@ esac
 
 ### `lib/cron-parse.sh` — Cron Expression Evaluator
 
-This is the most complex library component. It evaluates whether a 5-field cron expression matches the current minute.
-
 ```bash
 #!/usr/bin/env bash
 
 # cron_matches_now "minute hour dom month dow"
 # Returns 0 (true) if the cron expression matches the current minute.
-# Returns 1 (false) otherwise.
-
 cron_matches_now() {
     local cron_expr="$1"
 
@@ -720,11 +1054,11 @@ cron_matches_now() {
     read -r cron_min cron_hour cron_dom cron_mon cron_dow <<< "$cron_expr"
 
     local now_min now_hour now_dom now_mon now_dow
-    now_min=$(date +%-M)     # minute 0-59 (no leading zero)
-    now_hour=$(date +%-H)    # hour 0-23
-    now_dom=$(date +%-d)     # day of month 1-31
-    now_mon=$(date +%-m)     # month 1-12
-    now_dow=$(date +%u)      # day of week 1=Mon..7=Sun
+    now_min=$(date +%-M)
+    now_hour=$(date +%-H)
+    now_dom=$(date +%-d)
+    now_mon=$(date +%-m)
+    now_dow=$(date +%u)
     # Convert to cron convention: 0=Sun, 1=Mon..6=Sat
     [[ "$now_dow" -eq 7 ]] && now_dow=0
 
@@ -740,32 +1074,26 @@ cron_matches_now() {
 field_matches() {
     local expr="$1" val="$2" min_val="$3" max_val="$4"
 
-    # Wildcard
     [[ "$expr" == "*" ]] && return 0
 
-    # Step on wildcard: */N
     if [[ "$expr" =~ ^\*/([0-9]+)$ ]]; then
         local step="${BASH_REMATCH[1]}"
         (( val % step == 0 )) && return 0
         return 1
     fi
 
-    # Comma-separated list (may contain ranges)
     IFS=',' read -ra parts <<< "$expr"
     for part in "${parts[@]}"; do
-        # Range with step: N-M/S
         if [[ "$part" =~ ^([0-9]+)-([0-9]+)/([0-9]+)$ ]]; then
             local start="${BASH_REMATCH[1]}" end="${BASH_REMATCH[2]}" step="${BASH_REMATCH[3]}"
             if (( val >= start && val <= end && (val - start) % step == 0 )); then
                 return 0
             fi
-        # Range: N-M
         elif [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             local start="${BASH_REMATCH[1]}" end="${BASH_REMATCH[2]}"
             if (( val >= start && val <= end )); then
                 return 0
             fi
-        # Exact value
         elif [[ "$part" =~ ^[0-9]+$ ]]; then
             (( val == part )) && return 0
         fi
@@ -775,73 +1103,274 @@ field_matches() {
 }
 ```
 
-### `lib/lock.sh` — File-Based Locking
+### `lib/lock.sh` — Atomic Directory-Based Locking
+
+Uses `mkdir` instead of file check-then-write, which is atomic on POSIX systems.
 
 ```bash
 #!/usr/bin/env bash
 
-LOCKS_DIR="${HOME}/.skillrunner/locks"
+LOCKS_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner/locks"
 
 acquire_lock() {
-    local schedule_id="$1" pid="$2"
-    local lock_file="${LOCKS_DIR}/${schedule_id}.lock"
+    local schedule_id="$1"
+    local lock_dir="${LOCKS_DIR}/${schedule_id}"
+    local pid_file="${lock_dir}/pid"
 
-    # Check for stale lock
-    if [[ -f "$lock_file" ]]; then
-        local old_pid
-        old_pid=$(cat "$lock_file")
-        if kill -0 "$old_pid" 2>/dev/null; then
-            return 1  # Process still running
-        fi
-        # Stale lock, remove it
-        rm -f "$lock_file"
+    # Try atomic mkdir
+    if mkdir "$lock_dir" 2>/dev/null; then
+        echo $$ > "$pid_file"
+        return 0
     fi
 
-    echo "$pid" > "$lock_file"
-    return 0
+    # Lock dir exists — check if holder is still alive
+    if [[ -f "$pid_file" ]]; then
+        local old_pid
+        old_pid=$(cat "$pid_file")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            return 1  # still running
+        fi
+    fi
+
+    # Stale lock — reclaim
+    rm -rf "$lock_dir"
+    if mkdir "$lock_dir" 2>/dev/null; then
+        echo $$ > "$pid_file"
+        return 0
+    fi
+
+    return 1  # someone else grabbed it
 }
 
 release_lock() {
     local schedule_id="$1"
-    rm -f "${LOCKS_DIR}/${schedule_id}.lock"
+    rm -rf "${LOCKS_DIR}/${schedule_id}"
 }
 
 is_locked() {
     local schedule_id="$1"
-    local lock_file="${LOCKS_DIR}/${schedule_id}.lock"
+    local lock_dir="${LOCKS_DIR}/${schedule_id}"
+    local pid_file="${lock_dir}/pid"
 
-    if [[ -f "$lock_file" ]]; then
+    if [[ -d "$lock_dir" ]] && [[ -f "$pid_file" ]]; then
         local old_pid
-        old_pid=$(cat "$lock_file")
+        old_pid=$(cat "$pid_file")
         if kill -0 "$old_pid" 2>/dev/null; then
             return 0  # locked
         fi
-        # Stale, clean up
-        rm -f "$lock_file"
+        # Stale
+        rm -rf "$lock_dir"
     fi
-    return 1  # not locked
+    return 1
 }
 ```
 
-### `lib/logging.sh` — Log Writing
+### `lib/logging.sh` — Log Writing with Rotation
 
 ```bash
 #!/usr/bin/env bash
 
-LOG_FILE="${HOME}/.skillrunner/logs/runner.log"
-MAX_LOG_SIZE=$((5 * 1024 * 1024))  # 5MB
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
+LOG_FILE="${SKILLRUNNER_HOME}/logs/runner.log"
+RUNS_LOG="${SKILLRUNNER_HOME}/logs/runs.jsonl"
+MAX_LOG_SIZE=$((5 * 1024 * 1024))    # 5MB
+MAX_RUNS_SIZE=$((10 * 1024 * 1024))  # 10MB
+
+_get_file_size() {
+    stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
+}
+
+_rotate_if_needed() {
+    local file="$1" max_size="$2"
+    if [[ -f "$file" ]] && (( $(_get_file_size "$file") > max_size )); then
+        mv "$file" "${file}.1"
+    fi
+}
 
 log_daemon() {
     local msg="$1"
     local timestamp
     timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     echo "[${timestamp}] ${msg}" >> "$LOG_FILE"
+    _rotate_if_needed "$LOG_FILE" "$MAX_LOG_SIZE"
+}
 
-    # Rotate if too large
-    if [[ -f "$LOG_FILE" ]] && (( $(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0) > MAX_LOG_SIZE )); then
-        mv "$LOG_FILE" "${LOG_FILE}.1"
-        # Keep only one rotated file
-        rm -f "${LOG_FILE}.2"
+rotate_runs_log() {
+    _rotate_if_needed "$RUNS_LOG" "$MAX_RUNS_SIZE"
+}
+```
+
+### `lib/notify.sh` — Telegram Notification Dispatch
+
+```bash
+#!/usr/bin/env bash
+
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
+SECRETS_FILE="${SKILLRUNNER_HOME}/secrets.env"
+
+# Load bot token
+_load_telegram_token() {
+    if [[ -f "$SECRETS_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$SECRETS_FILE"
+    fi
+    echo "${SKILLRUNNER_TELEGRAM_TOKEN:-}"
+}
+
+# send_telegram "chat_id" "message_text"
+# Sends a Markdown-formatted message via Telegram Bot API.
+send_telegram() {
+    local chat_id="$1" text="$2"
+    local token
+    token=$(_load_telegram_token)
+
+    if [[ -z "$token" ]]; then
+        log_daemon "NOTIFY: No Telegram token configured, skipping"
+        return 1
+    fi
+
+    local response http_code
+    response=$(curl -s -w "\n%{http_code}" -X POST \
+        "https://api.telegram.org/bot${token}/sendMessage" \
+        -d chat_id="$chat_id" \
+        -d parse_mode="Markdown" \
+        -d text="$text" \
+        -d disable_web_page_preview="true")
+
+    http_code=$(echo "$response" | tail -1)
+
+    if [[ "$http_code" != "200" ]]; then
+        log_daemon "NOTIFY: Telegram API returned HTTP ${http_code}"
+        return 1
+    fi
+
+    return 0
+}
+
+# expand_template "template_string" — replaces ${var} with values from
+# the environment variables set by the caller.
+expand_template() {
+    local tmpl="$1"
+    tmpl="${tmpl//\$\{name\}/$notify_skill}"
+    tmpl="${tmpl//\$\{status\}/$notify_status}"
+    tmpl="${tmpl//\$\{exit_code\}/$notify_exit_code}"
+    tmpl="${tmpl//\$\{duration\}/$notify_duration}"
+    tmpl="${tmpl//\$\{cost\}/$notify_cost}"
+    tmpl="${tmpl//\$\{attempts\}/$notify_attempts}"
+    tmpl="${tmpl//\$\{max_attempts\}/$notify_max_attempts}"
+    tmpl="${tmpl//\$\{project_path\}/$notify_project_path}"
+    tmpl="${tmpl//\$\{result_preview\}/$notify_result_preview}"
+    tmpl="${tmpl//\$\{timestamp\}/$notify_timestamp}"
+    echo "$tmpl"
+}
+
+# default_template — returns a simple status message.
+default_template() {
+    local emoji="✅"
+    [[ "$notify_status" == "failure" ]] && emoji="❌"
+    echo "${emoji} *${notify_skill}* ${notify_status} (${notify_duration}s, \$${notify_cost})"
+}
+
+# generate_summary "summary_prompt" "result_text" — calls Claude to
+# produce a phone-friendly notification message.
+generate_summary() {
+    local summary_prompt="$1" result_text="$2"
+
+    local summary_output
+    summary_output=$(claude -p \
+        --output-format json \
+        --permission-mode plan \
+        --max-budget-usd 0.05 \
+        --no-session-persistence \
+        "You are generating a Telegram notification message. ${summary_prompt}
+
+Format the response for mobile reading using Telegram Markdown:
+- Use *bold* for emphasis
+- Keep it concise (under 500 characters)
+- Do not include backticks or code blocks
+
+Skill output to summarize:
+${result_text}" 2>/dev/null)
+
+    # Extract result from JSON response
+    local summary
+    summary=$(echo "$summary_output" | jq -r '.result // ""' 2>/dev/null)
+
+    if [[ -z "$summary" ]]; then
+        # Fallback to default template if summary generation fails
+        default_template
+        return
+    fi
+
+    echo "$summary"
+}
+
+# dispatch_notification — main entry point. Called by skillrunner-run
+# after a skill completes. Reads the notification config from the
+# schedule JSON and sends the appropriate message.
+#
+# Arguments: schedule_json, status, exit_code, duration, cost,
+#            attempts, max_attempts, result_text, timestamp
+dispatch_notification() {
+    local schedule_json="$1"
+
+    # Check if notification is configured
+    local has_notification
+    has_notification=$(echo "$schedule_json" | jq -e '.notification' 2>/dev/null) || return 0
+
+    local chat_id when mode template summary_prompt
+    chat_id=$(echo "$schedule_json" | jq -r '.notification.chat_id')
+    when=$(echo "$schedule_json" | jq -r '.notification.when // "always"')
+    mode=$(echo "$schedule_json" | jq -r '.notification.mode // "template"')
+    template=$(echo "$schedule_json" | jq -r '.notification.template // ""')
+    summary_prompt=$(echo "$schedule_json" | jq -r '.notification.summary_prompt // ""')
+
+    # Evaluate "when" condition
+    case "$when" in
+        always) ;;
+        on_failure)
+            [[ "$notify_status" != "failure" ]] && return 0
+            ;;
+        on_result)
+            [[ -z "$notify_result_preview" ]] && return 0
+            ;;
+        *)
+            log_daemon "NOTIFY: Unknown when condition '${when}', skipping"
+            return 0
+            ;;
+    esac
+
+    # Generate message based on mode
+    local message
+    case "$mode" in
+        template)
+            if [[ -n "$template" ]]; then
+                message=$(expand_template "$template")
+            else
+                message=$(default_template)
+            fi
+            ;;
+        summary)
+            if [[ -z "$summary_prompt" ]]; then
+                log_daemon "NOTIFY: summary mode requires summary_prompt, falling back to template"
+                message=$(default_template)
+            else
+                log_daemon "NOTIFY: Generating summary via Claude"
+                message=$(generate_summary "$summary_prompt" "$notify_result_preview")
+            fi
+            ;;
+        *)
+            log_daemon "NOTIFY: Unknown mode '${mode}', skipping"
+            return 0
+            ;;
+    esac
+
+    # Send it
+    log_daemon "NOTIFY: Sending to chat ${chat_id} (mode=${mode})"
+    if send_telegram "$chat_id" "$message"; then
+        log_daemon "NOTIFY: Sent successfully"
+    else
+        log_daemon "NOTIFY: Failed to send"
     fi
 }
 ```
@@ -851,44 +1380,86 @@ log_daemon() {
 ```bash
 #!/usr/bin/env bash
 
+SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
+CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
+
+# sync_projects — re-reads each registered project's .skillrunner.json
+# and updates the global config with any changes (new/removed/modified schedules).
+sync_projects() {
+    local projects
+    projects=$(jq -c '.projects[]?' "$CONFIG_FILE" 2>/dev/null) || return 0
+
+    while IFS= read -r project; do
+        local project_path
+        project_path=$(echo "$project" | jq -r '.path')
+
+        local project_config="${project_path}/.skillrunner.json"
+        if [[ ! -f "$project_config" ]]; then
+            log_daemon "Project config missing: ${project_config}, skipping sync"
+            continue
+        fi
+
+        # Check if .skillrunner.json has been modified since last registration
+        # by comparing schedule counts (lightweight check)
+        local file_count global_count
+        file_count=$(jq '.schedules | length' "$project_config" 2>/dev/null || echo 0)
+        global_count=$(jq --arg pp "$project_path" \
+            '[.schedules[] | select(.project_path == $pp)] | length' \
+            "$CONFIG_FILE" 2>/dev/null || echo 0)
+
+        if [[ "$file_count" != "$global_count" ]]; then
+            log_daemon "Project ${project_path} schedule count changed, re-registering"
+            # Re-register (skillrunner-ctl handles dedup)
+            "$(dirname "$0")/skillrunner-ctl" register "$project_path" 2>/dev/null || true
+        fi
+    done <<< "$projects"
+}
+
 # next_run_time "cron_expr"
 # Computes the next matching time for a cron expression.
 # Returns ISO 8601 timestamp.
-# (Brute-force: check each minute for the next 48 hours)
+# Iterates minute-by-minute for up to 62 days (covers "first of month" schedules).
 next_run_time() {
     local cron_expr="$1"
     local check_epoch
     check_epoch=$(date +%s)
-
-    # Round up to next minute boundary
     check_epoch=$(( (check_epoch / 60 + 1) * 60 ))
 
-    local max_checks=$((48 * 60))  # 48 hours
+    local max_checks=$((62 * 24 * 60))  # 62 days
+
+    local cron_min cron_hour cron_dom cron_mon cron_dow
+    read -r cron_min cron_hour cron_dom cron_mon cron_dow <<< "$cron_expr"
 
     for ((i = 0; i < max_checks; i++)); do
-        local check_date
-        check_date=$(date -r "$check_epoch" +"%Y-%m-%dT%H:%M:00Z" 2>/dev/null || \
-                     date -d "@$check_epoch" +"%Y-%m-%dT%H:%M:00Z" 2>/dev/null)
-
-        # Temporarily override date for cron check
         local min hour dom mon dow
-        min=$(date -r "$check_epoch" +%-M 2>/dev/null || date -d "@$check_epoch" +%-M)
-        hour=$(date -r "$check_epoch" +%-H 2>/dev/null || date -d "@$check_epoch" +%-H)
-        dom=$(date -r "$check_epoch" +%-d 2>/dev/null || date -d "@$check_epoch" +%-d)
-        mon=$(date -r "$check_epoch" +%-m 2>/dev/null || date -d "@$check_epoch" +%-m)
-        dow=$(date -r "$check_epoch" +%u 2>/dev/null || date -d "@$check_epoch" +%u)
-        [[ "$dow" -eq 7 ]] && dow=0
 
-        local cron_min cron_hour cron_dom cron_mon cron_dow
-        read -r cron_min cron_hour cron_dom cron_mon cron_dow <<< "$cron_expr"
+        # Use portable date: try GNU first, then BSD
+        if min=$(date -d "@$check_epoch" +%-M 2>/dev/null); then
+            hour=$(date -d "@$check_epoch" +%-H)
+            dom=$(date -d "@$check_epoch" +%-d)
+            mon=$(date -d "@$check_epoch" +%-m)
+            dow=$(date -d "@$check_epoch" +%u)
+        else
+            min=$(date -r "$check_epoch" +%-M)
+            hour=$(date -r "$check_epoch" +%-H)
+            dom=$(date -r "$check_epoch" +%-d)
+            mon=$(date -r "$check_epoch" +%-m)
+            dow=$(date -r "$check_epoch" +%u)
+        fi
+        [[ "$dow" -eq 7 ]] && dow=0
 
         if field_matches "$cron_min" "$min" 0 59 && \
            field_matches "$cron_hour" "$hour" 0 23 && \
            field_matches "$cron_dom" "$dom" 1 31 && \
            field_matches "$cron_mon" "$mon" 1 12 && \
            field_matches "$cron_dow" "$dow" 0 6; then
-            echo "$check_date"
-            return 0
+            # Output in ISO format
+            if date -d "@$check_epoch" +"%Y-%m-%dT%H:%M:00Z" 2>/dev/null; then
+                return 0
+            else
+                date -r "$check_epoch" +"%Y-%m-%dT%H:%M:00Z"
+                return 0
+            fi
         fi
 
         check_epoch=$((check_epoch + 60))
@@ -901,383 +1472,335 @@ next_run_time() {
 
 ---
 
-## Logging System Design
+## Skill Definition (`SKILL.md`)
 
-### Structured Run Log (`runs.jsonl`)
+There are two skills: `/schedule` for managing schedules, and `/schedule-setup` for
+helping users set up a new project with SkillRunner.
 
-One JSON object per line, appended after each run completes:
+### `SKILL.md` (the `/schedule` skill)
 
-```json
-{
-  "run_id": "a1b2c3d4e5f6g7h8",
-  "schedule_id": "a1b2c3d4",
-  "skill": "concert-search",
-  "args": "",
-  "started_at": "2026-03-29T09:00:00Z",
-  "ended_at": "2026-03-29T09:02:15Z",
-  "duration_seconds": 135,
-  "exit_code": 0,
-  "status": "success",
-  "cost_usd": 0.23,
-  "attempts": 1,
-  "result_preview": "Found 3 new concerts matching your preferences...",
-  "stdout_file": "/Users/nicholas/.skillrunner/logs/output/a1b2c3d4e5f6g7h8.stdout",
-  "stderr_file": "/Users/nicholas/.skillrunner/logs/output/a1b2c3d4e5f6g7h8.stderr"
-}
+```markdown
+---
+name: schedule
+description: >
+  Manage scheduled automatic execution of Claude Code skills and bash commands.
+  Register projects, add/remove schedules, view logs and daemon status.
+user-invocable: true
+argument-hint: "register|unregister|add|list|remove|logs|status|enable|disable|notify-setup"
+allowed-tools: Read, Bash, Glob, Grep
+---
+
+# SkillRunner — Scheduled Skill Execution
+
+You are managing scheduled automatic execution of Claude Code skills and bash
+commands. The user wants to set up tasks to run on a recurring schedule via a
+background daemon.
+
+## Data Locations
+
+- Global config: `~/.config/skillrunner/config.json`
+- Run logs: `~/.config/skillrunner/logs/runs.jsonl`
+- Daemon log: `~/.config/skillrunner/logs/runner.log`
+- Daemon state: `~/.config/skillrunner/state.json`
+- Per-project config: `.skillrunner.json` in project root
+- Secrets: `~/.config/skillrunner/secrets.env`
+
+## Schedule Types
+
+Each schedule has a `type` field:
+- `"skill"` — runs a Claude Code skill via `claude -p "/<skill> <args>"` (costs API credits)
+- `"command"` — runs a bash command directly (free, no Claude involved)
+
+## Commands
+
+### /schedule register [path]
+Register a project directory with SkillRunner. Reads `.skillrunner.json` from
+the project root (defaults to cwd) and adds its schedules to the global config.
+Run: `skillrunner-ctl register [path]`
+
+### /schedule unregister [path]
+Remove all schedules for a project. Run: `skillrunner-ctl unregister [path]`
+
+### /schedule add
+Interactively create a schedule. First ask:
+1. **Type** — skill or command?
+
+If skill:
+2. **Skill name** — which slash command to run (e.g., `concert-search`)
+3. **Arguments** (optional)
+4. **Permission mode** (optional) — `plan` (default), `acceptEdits`, `bypassPermissions`
+5. **Budget per run** (optional) — default $0.50
+
+If command:
+2. **Command** — the bash command to run (e.g., `./scripts/backup.sh`)
+
+Then for both:
+- **Schedule** — cron expression or natural language ("daily at 9am")
+- **Timeout** (optional) — default 300s
+- **Retry** (optional) — max attempts and delay
+
+Then notification (optional):
+- **Notify?** — whether to send Telegram notifications (default: no)
+- **Chat ID** — who to notify
+- **When** — always / on_failure / on_result
+- **Mode** — template (free) or summary (costs ~$0.01-0.05 per notification)
+- **Template** (if template mode) — custom template or use default
+- **Summary prompt** (if summary mode) — what to tell Claude about summarizing
+
+Convert natural language to cron. Write to `.skillrunner.json` in the current
+project, then re-register with `skillrunner-ctl register`.
+
+### /schedule list
+Run `skillrunner-ctl list` and display all schedules.
+
+### /schedule remove
+Show the list, ask which to remove by ID or name. Remove from
+`.skillrunner.json` and re-register.
+
+### /schedule logs [--name NAME] [--last N]
+Read `~/.config/skillrunner/logs/runs.jsonl` and display. Default: last 10 runs.
+Show: timestamp, type, name, duration, exit code, cost, truncated output.
+
+### /schedule status
+Run `skillrunner-ctl status`.
+
+### /schedule enable / disable
+Toggle `enabled` on a schedule in `.skillrunner.json` and re-register.
+
+### /schedule notify-setup
+Guide the user through Telegram notification setup:
+1. Explain how to create a bot via @BotFather on Telegram
+2. Ask for the bot token
+3. Write it to `~/.config/skillrunner/secrets.env`
+4. Help them find their chat_id (tell them to message the bot, then
+   fetch `https://api.telegram.org/bot<TOKEN>/getUpdates` via curl)
+5. For group notifications: explain adding the bot to a group
+6. Send a test message to verify the setup works
+
+## Installation Check
+Before any command, verify skillrunner-ctl is on PATH. If not, tell the user
+to add the SkillRunner home-manager module to their nix config:
+  services.skillrunner.enable = true;
 ```
 
-### Log Rotation Strategy
+### `SETUP_SKILL.md` (the `/schedule-setup` skill)
+
+This is a separate skill for helping users set up a new project with SkillRunner.
+It lives alongside `SKILL.md` in the skill directory.
+
+```markdown
+---
+name: schedule-setup
+description: >
+  Set up a project to use SkillRunner. Helps decide between bash commands
+  and Claude skills, creates .skillrunner.json, and registers the project.
+user-invocable: true
+argument-hint: ""
+allowed-tools: Read, Write, Bash, Glob, Grep, Edit
+---
+
+# SkillRunner Project Setup
+
+You are helping the user set up a new project to use SkillRunner — a daemon
+that runs Claude Code skills and bash commands on a schedule.
+
+## Your Job
+
+Walk the user through setting up `.skillrunner.json` in their project. This
+involves understanding what they want to automate and helping them decide the
+best approach for each task.
+
+## Setup Flow
+
+### Step 1: Understand the project
+- Look at the current directory to understand what kind of project this is
+- Read any existing README, CLAUDE.md, or project config files
+- Ask the user what tasks they want to run on a schedule
+
+### Step 2: For each task, help decide: skill vs command
+
+Guide the user with these criteria:
+
+**Use a bash command (`"type": "command"`) when:**
+- The task is deterministic and well-defined (run a script, pull git, ping a URL)
+- No AI reasoning is needed
+- There's an existing script or CLI tool that does the job
+- Cost matters — commands are free, skills cost API credits
+- The task is simple enough to express as a one-liner or script
+- Examples: `git pull && git status`, `./scripts/deploy.sh`, `curl -s https://example.com/health`, `df -h | mail -s "Disk report" user@example.com`
+
+**Use a Claude skill (`"type": "skill"`) when:**
+- The task requires reading and understanding code or documents
+- The task needs AI judgment (e.g., "are there any security issues?")
+- The output needs to be summarized or interpreted
+- The task involves searching, analyzing, or generating content
+- The task would be hard to express as a bash script
+- Examples: code review, dependency audit, content generation, log analysis, research tasks
+
+**Hybrid approach:** Sometimes the best solution is a bash command that
+gathers data (free) paired with a skill schedule that analyzes it (paid).
+For example: a command that runs `npm audit --json > /tmp/audit.json` every
+hour, and a daily skill that reads that file and summarizes findings.
+
+### Step 3: For each task, gather details
+- Schedule (natural language is fine, you'll convert to cron)
+- For commands: help write the command or script if needed
+- For skills: check if the skill exists in `~/.claude/skills/` or the
+  project's `.claude/skills/`, offer to help create it if not
+- Timeout and retry settings
+- Notification preferences (if they've set up Telegram)
+
+### Step 4: Create .skillrunner.json
+Write the config file to the project root.
+
+### Step 5: Register
+Run `skillrunner-ctl register` to activate the schedules.
+
+### Step 6: Verify
+Run `skillrunner-ctl status` and `skillrunner-ctl list` to confirm
+everything is registered correctly.
+
+## Important Notes
+
+- Commands run from the project root directory
+- Commands run as the user's shell (bash), with the project root as cwd
+- Skills run via `claude -p` in the project directory
+- If the user needs a script that doesn't exist yet, help them write it
+  and save it in the project (e.g., `scripts/check-health.sh`)
+- Always make scripts executable (`chmod +x`)
+- If the user needs a Claude skill that doesn't exist, help them create
+  it in `.claude/skills/` with a proper SKILL.md
+- Remind the user to commit `.skillrunner.json` and any new scripts to git
+```
+
+---
+
+## Platform Support
+
+| Feature | NixOS / Linux | macOS |
+|---|---|---|
+| Service manager | systemd user timer | LaunchAgent |
+| Bash | 5.x from nixpkgs | 5.x from nixpkgs (via nix wrapper) |
+| `timeout` | coreutils from nixpkgs | coreutils from nixpkgs |
+| `jq` | from nixpkgs | from nixpkgs |
+| `stat` file size | `stat -c%s` | `stat -f%z` (both handled) |
+| `date` epoch conversion | `date -d @epoch` | `date -r epoch` (both handled) |
+| Sleep/wake catch-up | systemd `Persistent=true` | LaunchAgent fires on wake |
+| Install method | `services.skillrunner.enable = true` | same (home-manager) |
+
+All platform differences are handled either by Nix (wrapping with correct tools on PATH) or by portable bash with GNU/BSD fallbacks.
+
+---
+
+## Logging and Rotation
 
 | File | Max Size | Rotation |
 |---|---|---|
-| `runner.log` | 5 MB | Rotate to `runner.log.1`, keep 1 old copy |
-| `runs.jsonl` | 10 MB | Rotate to `runs.jsonl.1`, keep 1 old copy |
+| `runner.log` | 5 MB | Rotate to `.1`, keep 1 copy |
+| `runs.jsonl` | 10 MB | Rotate to `.1`, keep 1 copy |
 | `output/*.stdout` | 100 KB each | Truncated at write time |
 | `output/*.stderr` | 100 KB each | Truncated at write time |
-| `launchd-stdout.log` | 1 MB | Managed by launchd restart |
-
-A weekly cleanup job (also run by the daemon) removes output files older than 30 days:
-
-```bash
-find "${OUTPUT_DIR}" -name "*.stdout" -mtime +30 -delete
-find "${OUTPUT_DIR}" -name "*.stderr" -mtime +30 -delete
-```
+| Output files > 30 days | — | Deleted by daemon hourly cleanup |
 
 ---
 
-## Error Handling and Edge Cases
+## Error Handling
 
-### Authentication Failures
-
-When Claude is not authenticated, `claude -p` exits with a non-zero code and stderr contains auth-related messages. The daemon captures this in the run log. The `/schedule status` command surfaces recent failures prominently.
-
-Detection (in `skillrunner-run`):
-```bash
-if grep -qi "auth\|login\|token\|expired\|unauthorized" "$stderr_file" 2>/dev/null; then
-    log_daemon "RUN ${RUN_ID}: Authentication error detected"
-    # Write a marker so /schedule status can highlight this
-fi
-```
-
-### Skill Not Found
-
-If the user schedules a skill that doesn't exist (or is later removed), Claude will respond with an error message in its output but may still exit 0. The daemon checks the JSON response for `is_error: true`:
-
-```bash
-if jq -e '.is_error == true' "$stdout_file" > /dev/null 2>&1; then
-    status="failure"
-fi
-```
-
-### Overlapping Runs
-
-The file-based lock system (one lock file per schedule ID containing the PID) prevents the same schedule from running concurrently. Stale locks are detected by checking if the PID is still alive (`kill -0`).
-
-### Timeout Handling
-
-The `timeout` command (from coreutils) wraps the `claude` invocation. Exit code 124 indicates the process was killed due to timeout. This is logged distinctly from other failures.
-
-### System Sleep/Wake
-
-LaunchAgent with `StartInterval` handles sleep correctly on macOS: if the machine is asleep when a run is due, the LaunchAgent fires immediately on wake. Multiple missed intervals do NOT queue up -- only one invocation occurs after wake.
-
-### Disk Space
-
-Before each run, the daemon checks available disk space:
-```bash
-available_kb=$(df -k "$SKILLRUNNER_HOME" | awk 'NR==2 {print $4}')
-if (( available_kb < 102400 )); then  # 100MB minimum
-    log_daemon "WARNING: Low disk space (${available_kb}KB), skipping runs"
-    exit 0
-fi
-```
-
-### Claude CLI Not Found
-
-The daemon uses an absolute path (`/Users/nicholas/.nix-profile/bin/claude`) but also validates at startup:
-```bash
-if ! command -v claude &>/dev/null && [[ ! -x "/Users/nicholas/.nix-profile/bin/claude" ]]; then
-    log_daemon "ERROR: claude CLI not found"
-    exit 1
-fi
-```
-
-### Cost Tracking
-
-Each run's cost is extracted from Claude's JSON output (`total_cost_usd`). The `/schedule logs` command can aggregate costs by skill or time period. The `--max-budget-usd` flag provides a hard cap per invocation.
+- **Claude not on PATH:** Daemon logs error and exits cleanly.
+- **Auth failures:** Captured in stderr, surfaced via `/schedule logs`.
+- **Skill not found:** Claude returns `is_error: true` in JSON, logged as failure.
+- **Overlapping runs:** Atomic `mkdir`-based locks prevent concurrent execution of same schedule.
+- **Timeouts:** `timeout` from coreutils, exit code 124 logged distinctly.
+- **Sleep/wake:** systemd `Persistent=true` / LaunchAgent catch-up behavior.
+- **Low disk space:** Daemon checks for 100MB minimum before running.
+- **Stale locks:** PID checked with `kill -0`, cleaned up automatically.
+- **Telegram failures:** If notification send fails (bad token, network error), logged but does not affect the run's success/failure status. The skill run is independent of notification delivery.
+- **Summary generation failures:** If the Claude call for summary mode fails, falls back to the default template so a notification is still sent.
 
 ---
 
-## Installation Script (`install.sh`)
+## Security
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SKILLRUNNER_HOME="${HOME}/.skillrunner"
-PLIST_NAME="com.skillrunner.daemon"
-PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
-
-echo "=== SkillRunner Installer ==="
-echo ""
-
-# 1. Check prerequisites
-echo "Checking prerequisites..."
-
-CLAUDE_BIN=$(which claude 2>/dev/null || echo "")
-if [[ -z "$CLAUDE_BIN" ]]; then
-    echo "ERROR: claude CLI not found in PATH"
-    exit 1
-fi
-echo "  claude CLI: ${CLAUDE_BIN}"
-
-if ! command -v jq &>/dev/null; then
-    echo "ERROR: jq is required but not installed"
-    echo "  Install with: brew install jq (or nix-env -iA nixpkgs.jq)"
-    exit 1
-fi
-echo "  jq: $(which jq)"
-
-# 2. Create directory structure
-echo ""
-echo "Creating ~/.skillrunner/ ..."
-mkdir -p "${SKILLRUNNER_HOME}"/{logs/output,locks}
-
-if [[ ! -f "${SKILLRUNNER_HOME}/config.json" ]]; then
-    echo '{"version": 1, "schedules": []}' | jq . > "${SKILLRUNNER_HOME}/config.json"
-fi
-
-echo '{"last_wake": null, "pid": null, "version": 1}' | jq . > "${SKILLRUNNER_HOME}/state.json"
-
-# 3. Make scripts executable
-echo "Setting permissions..."
-chmod +x "${SCRIPT_DIR}"/bin/*
-
-# 4. Generate and install LaunchAgent plist
-echo "Installing LaunchAgent..."
-CLAUDE_DIR=$(dirname "$CLAUDE_BIN")
-
-cat > "$PLIST_DST" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${PLIST_NAME}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>${SCRIPT_DIR}/bin/skillrunner-daemon</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>60</integer>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${SKILLRUNNER_HOME}/logs/launchd-stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>${SKILLRUNNER_HOME}/logs/launchd-stderr.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>${CLAUDE_DIR}:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HOME</key>
-        <string>${HOME}</string>
-    </dict>
-    <key>Nice</key>
-    <integer>10</integer>
-    <key>ProcessType</key>
-    <string>Background</string>
-</dict>
-</plist>
-PLIST
-
-# 5. Install skill symlink
-echo "Installing Claude Code skill symlink..."
-mkdir -p "${HOME}/.claude/skills"
-ln -sfn "$SCRIPT_DIR" "${HOME}/.claude/skills/schedule"
-
-# 6. Load LaunchAgent
-echo "Loading LaunchAgent..."
-launchctl unload "$PLIST_DST" 2>/dev/null || true
-launchctl load "$PLIST_DST"
-
-echo ""
-echo "=== Installation Complete ==="
-echo ""
-echo "  Data directory:  ${SKILLRUNNER_HOME}/"
-echo "  LaunchAgent:     ${PLIST_DST}"
-echo "  Skill command:   /schedule (available in Claude Code)"
-echo ""
-echo "  Next steps:"
-echo "    1. Open Claude Code"
-echo "    2. Type: /schedule add"
-echo "    3. Follow the prompts to schedule your first skill"
-echo ""
-echo "  Management:"
-echo "    ${SCRIPT_DIR}/bin/skillrunner-ctl status"
-echo "    ${SCRIPT_DIR}/bin/skillrunner-ctl stop"
-echo "    ${SCRIPT_DIR}/bin/skillrunner-ctl start"
-```
+1. **Default permission mode is `plan`** (read-only). Skills can't write files or run commands unless explicitly configured per-schedule.
+2. **Budget caps** via `--max-budget-usd` per run.
+3. **No secrets in config.** Claude auth is handled by its own CLI.
+4. **Locks prevent runaway execution.**
+5. **Output truncation** prevents disk exhaustion.
+6. **Secrets isolation.** Telegram bot token lives in `secrets.env` (chmod 600), not in `.skillrunner.json` which is version-controlled. The token never appears in logs or run output.
 
 ---
 
 ## Step-by-Step Implementation Guide
 
-### Phase 1: Foundation (Day 1)
+### Phase 1: Foundation
+- Create directory structure and `flake.nix`
+- Implement `lib/cron-parse.sh` with tests
+- Implement `lib/lock.sh` (atomic mkdir-based)
+- Implement `lib/logging.sh` with rotation for both log files
+- Implement `lib/schedule.sh` with `next_run_time` and `sync_projects`
 
-**Goal:** Directory structure, library functions, config format.
+### Phase 2: Daemon Core
+- Implement `bin/skillrunner-run` (single-run executor)
+- Implement `bin/skillrunner-daemon` (wake-and-check)
+- Test manually with a `*/1 * * * *` schedule
 
-1. Create the project directory structure:
-   ```
-   mkdir -p /Users/nicholas/Documents/Tools/SkillRunner/{bin,lib,templates}
-   ```
+### Phase 3: Project Registration
+- Implement `bin/skillrunner-ctl` with register/unregister/status/list
+- Define `.skillrunner.json` schema
+- Test register → daemon picks it up → skill runs
 
-2. Implement `lib/cron-parse.sh` with the `field_matches` and `cron_matches_now` functions. Write tests:
-   ```bash
-   # Test script: test-cron.sh
-   source lib/cron-parse.sh
-   # Override date for testing, or test field_matches directly
-   assert field_matches "*/5" "0" 0 59   # true
-   assert field_matches "*/5" "3" 0 59   # false
-   assert field_matches "1-5" "3" 1 31   # true
-   assert field_matches "1,15" "15" 1 31 # true
-   ```
+### Phase 4: Nix Packaging
+- Complete `flake.nix` with `makeWrapper` for all dependencies
+- Write `module/home-manager.nix` with systemd + launchd support
+- Test on NixOS: add to flake, `home-manager switch`, verify timer runs
+- Test on macOS: same flow, verify LaunchAgent
 
-3. Implement `lib/lock.sh` with `acquire_lock`, `release_lock`, `is_locked`.
+### Phase 5: Claude Code Skills
+- Write `SKILL.md` for `/schedule` — management commands
+- Write `SETUP_SKILL.md` for `/schedule-setup` — project setup wizard
+- Test `/schedule add` with both skill and command types
+- Test `/schedule-setup` end-to-end: understand project, recommend skill vs command, create `.skillrunner.json`, register
+- Ensure `/schedule add` writes to `.skillrunner.json` and re-registers
 
-4. Implement `lib/logging.sh` with `log_daemon` and rotation logic.
+### Phase 6: Telegram Notifications
+- Implement `lib/notify.sh` with template expansion, summary generation, and Telegram sending
+- Integrate `dispatch_notification` into `skillrunner-run`
+- Add `notify-setup` command to the `/schedule` skill
+- Test template mode (verify variable expansion, default template)
+- Test summary mode (verify Claude call, Markdown formatting, fallback on failure)
+- Test `when` conditions (always, on_failure, on_result)
+- Test with personal chat_id and group chat_id
+- Verify secrets.env is created with correct permissions (600)
 
-5. Implement `lib/schedule.sh` with `next_run_time`.
-
-6. Write a minimal `config.json` schema and validate with jq.
-
-### Phase 2: Daemon Core (Day 2)
-
-**Goal:** Working daemon that can detect due schedules and invoke claude.
-
-1. Write `bin/skillrunner-run` -- the single-run executor. Test manually:
-   ```bash
-   # Create a test schedule in config.json, then:
-   ./bin/skillrunner-run "test-id"
-   ```
-
-2. Write `bin/skillrunner-daemon` -- the wake-and-check loop. Test by running directly:
-   ```bash
-   # Set a schedule for "every minute" and run:
-   bash ./bin/skillrunner-daemon
-   ```
-
-3. Verify JSON output parsing -- ensure cost, duration, result_preview are correctly extracted from Claude's `--output-format json` response.
-
-4. Test timeout handling with a deliberately slow skill.
-
-### Phase 3: LaunchAgent Integration (Day 3)
-
-**Goal:** Daemon runs automatically via macOS LaunchAgent.
-
-1. Write the plist template in `templates/`.
-
-2. Write `install.sh` with prerequisite checks.
-
-3. Write `bin/skillrunner-ctl` for install/uninstall/start/stop/status.
-
-4. Test the full lifecycle:
-   ```bash
-   ./install.sh
-   skillrunner-ctl status
-   # Add a test schedule (every minute)
-   # Wait 2 minutes, check logs
-   skillrunner-ctl stop
-   ```
-
-5. Test sleep/wake behavior by putting the machine to sleep and verifying runs resume.
-
-### Phase 4: Claude Code Skill (Day 4)
-
-**Goal:** The `/schedule` skill works interactively in Claude Code.
-
-1. Write `SKILL.md` with the frontmatter and all command documentation.
-
-2. Test each subcommand in Claude Code:
-   - `/schedule status` -- should show daemon state
-   - `/schedule add` -- should prompt for details and write config
-   - `/schedule list` -- should display all schedules with next run times
-   - `/schedule logs` -- should show recent run history
-   - `/schedule remove` -- should remove a schedule
-
-3. Ensure the skill handles the "not installed" case gracefully by offering to run the installer.
-
-### Phase 5: Polish and Hardening (Day 5)
-
-**Goal:** Production-ready reliability.
-
-1. Add disk space check before runs.
-
-2. Add authentication error detection and surfacing.
-
-3. Add log rotation for `runs.jsonl` (not just `runner.log`).
-
-4. Add the 30-day output file cleanup routine.
-
-5. Add a `--dry-run` flag to `skillrunner-daemon` for testing without actually invoking Claude.
-
-6. Stress test: schedule 5+ skills at the same minute, verify no race conditions.
-
-7. Add cost aggregation to `/schedule logs` (total cost per skill, per day, etc.).
-
-8. Document the project with a top-level README covering installation, usage, and troubleshooting.
+### Phase 7: Hardening
+- Disk space checks
+- Auth error detection
+- `runs.jsonl` rotation
+- 30-day output cleanup
+- Stress test: 5+ schedules at same minute
 
 ---
 
-## Dependencies
+## Dependencies (all provided by Nix)
 
-| Dependency | Purpose | Availability |
-|---|---|---|
-| `bash` 4+ | Script execution | macOS ships bash 3.2; use `/bin/bash` or nix bash |
-| `jq` | JSON parsing | `brew install jq` or via nix |
-| `claude` CLI | Skill execution | Already installed at `/Users/nicholas/.nix-profile/bin/claude` |
-| `timeout` (coreutils) | Kill long-running processes | `brew install coreutils` provides `gtimeout`; or use nix |
-| `openssl` | Random ID generation | Ships with macOS |
-| `launchctl` | LaunchAgent management | Ships with macOS |
+| Dependency | Purpose |
+|---|---|
+| `bash` 5.x | Script execution |
+| `jq` | JSON parsing |
+| `coreutils` | `timeout`, `stat`, `truncate`, `date` |
+| `openssl` | Random ID generation |
+| `curl` | Telegram API calls |
+| `claude-code` | Skill execution (expected on user's PATH via their own nix config) |
 
-**Important bash version note:** macOS ships bash 3.2 which lacks some features (associative arrays, `readarray`). The scripts above are written to be bash 3.2 compatible. If nix provides a newer bash, update the plist `ProgramArguments` to use it.
-
-**Important coreutils note:** macOS `timeout` may not exist. The scripts should detect this and fall back:
-```bash
-TIMEOUT_CMD="timeout"
-if ! command -v timeout &>/dev/null; then
-    if command -v gtimeout &>/dev/null; then
-        TIMEOUT_CMD="gtimeout"
-    else
-        # Fallback: no timeout enforcement
-        TIMEOUT_CMD=""
-    fi
-fi
-```
-
----
-
-## Security Considerations
-
-1. **Permission modes:** Default to `plan` (read-only) for scheduled runs. This prevents autonomous skills from modifying files or running arbitrary commands without explicit opt-in per schedule.
-
-2. **Budget caps:** Every schedule has a `max_budget_usd` field. Combined with Claude's `--max-budget-usd` flag, this provides a hard cost ceiling per run.
-
-3. **No secrets in config:** The `config.json` file contains no API keys or credentials. Claude's own authentication is handled by its CLI (OAuth tokens stored in `~/.claude/`).
-
-4. **Lock files prevent abuse:** A compromised or buggy skill cannot spawn infinite parallel runs.
-
-5. **Output truncation:** Large outputs are truncated to 100KB to prevent disk exhaustion.
+Note: `claude-code` is NOT bundled by SkillRunner's flake — it's expected to be installed separately (as you already have in `claude.nix`). The daemon just needs `claude` to be on PATH.
 
 ---
 
 ## Future Enhancements
 
-- **Notification system:** Send macOS notifications (`osascript -e 'display notification'`) on failure or interesting results.
-- **Web dashboard:** A simple local web UI to view schedules and logs.
-- **Conditional scheduling:** Run a skill only if a previous skill's output matches a pattern (pipeline chaining).
-- **Remote monitoring:** Optional webhook to post run results to Slack/Discord.
-- **Multi-machine sync:** Store config in iCloud or git for syncing across machines.
+- **Desktop notifications:** In addition to Telegram, `notify-send` (Linux) or `osascript` (macOS) for local desktop alerts
+- **Additional notification channels:** Discord webhooks, ntfy.sh, email — as alternative backends behind the same `notification` config schema
+- **Conditional scheduling:** Run only if a previous skill's output matches a pattern (pipeline chaining)
+- **NixOS system module:** In addition to home-manager, a NixOS system-level module for running schedules as a system service
+- **`flake.nix` template:** `nix flake init -t skillrunner` to scaffold a new project with `.skillrunner.json`
+- **Cost dashboard:** Aggregate notification + skill costs per schedule, per day, per month
