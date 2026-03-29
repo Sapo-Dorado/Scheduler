@@ -111,7 +111,7 @@ cmd_status() {
         echo ""
         echo "Last 5 runs:"
         tail -5 "${SKILLRUNNER_HOME}/logs/runs.jsonl" | \
-            jq -r '"  \(.started_at) | \(.name) | \(.status) | \(.duration_seconds)s | $\(.cost_usd)"'
+            jq -r '"  \(.started_at) | \(.name) | \(.status) | \(.duration_seconds)s | $\(.cost_usd // "n/a")"'
     fi
 }
 

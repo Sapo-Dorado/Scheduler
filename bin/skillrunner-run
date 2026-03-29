@@ -152,7 +152,7 @@ for f in "$stdout_file" "$stderr_file"; do
 done
 
 # Write structured log entry (atomic via temp file + append)
-log_entry=$(jq -n \
+log_entry=$(jq -cn \
     --arg run_id "$RUN_ID" \
     --arg schedule_id "$SCHEDULE_ID" \
     --arg type "$run_type" \
