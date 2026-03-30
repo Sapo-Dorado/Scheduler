@@ -35,6 +35,79 @@ sync_projects() {
     done <<< "$projects"
 }
 
+# schedule_is_overdue "schedule_id" "cron_expr"
+# Returns 0 (true) if any cron-matching minute has elapsed since the
+# schedule was last dispatched.  Always true on first run.
+# Resilient to missed wakes, reboots, and timer drift.
+schedule_is_overdue() {
+    local schedule_id="$1"
+    local cron_expr="$2"
+
+    local state_file="${SKILLRUNNER_HOME}/state.json"
+    local last_ts
+    last_ts=$(jq -r --arg sid "$schedule_id" \
+        '.last_dispatched[$sid] // ""' "$state_file" 2>/dev/null)
+
+    # No record = first run, always overdue
+    if [[ -z "$last_ts" || "$last_ts" == "null" ]]; then
+        return 0
+    fi
+
+    # Convert last_dispatched to epoch (GNU date, then BSD fallback)
+    local last_epoch
+    if last_epoch=$(date -d "$last_ts" +%s 2>/dev/null); then
+        :
+    else
+        last_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_ts" +%s 2>/dev/null) || return 0
+    fi
+
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    # Start checking from the minute AFTER last_dispatched
+    local check_epoch=$(( (last_epoch / 60 + 1) * 60 ))
+
+    # Cap at current minute (inclusive)
+    local end_epoch=$(( (now_epoch / 60) * 60 ))
+
+    # Safety: if gap exceeds 24 hours, just consider it overdue
+    if (( end_epoch - check_epoch > 86400 )); then
+        return 0
+    fi
+
+    local cron_min cron_hour cron_dom cron_mon cron_dow
+    read -r cron_min cron_hour cron_dom cron_mon cron_dow <<< "$cron_expr"
+
+    while (( check_epoch <= end_epoch )); do
+        local min hour dom mon dow
+        if min=$(date -d "@$check_epoch" +%-M 2>/dev/null); then
+            hour=$(date -d "@$check_epoch" +%-H)
+            dom=$(date -d "@$check_epoch" +%-d)
+            mon=$(date -d "@$check_epoch" +%-m)
+            dow=$(date -d "@$check_epoch" +%u)
+        else
+            min=$(date -r "$check_epoch" +%-M)
+            hour=$(date -r "$check_epoch" +%-H)
+            dom=$(date -r "$check_epoch" +%-d)
+            mon=$(date -r "$check_epoch" +%-m)
+            dow=$(date -r "$check_epoch" +%u)
+        fi
+        [[ "$dow" -eq 7 ]] && dow=0
+
+        if field_matches "$cron_min" "$min" 0 59 && \
+           field_matches "$cron_hour" "$hour" 0 23 && \
+           field_matches "$cron_dom" "$dom" 1 31 && \
+           field_matches "$cron_mon" "$mon" 1 12 && \
+           field_matches "$cron_dow" "$dow" 0 6; then
+            return 0
+        fi
+
+        check_epoch=$((check_epoch + 60))
+    done
+
+    return 1
+}
+
 # next_run_time "cron_expr"
 # Computes the next matching time for a cron expression.
 # Returns ISO 8601 timestamp.

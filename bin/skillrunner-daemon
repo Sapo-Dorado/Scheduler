@@ -17,10 +17,27 @@ done
 # Library path set by Nix wrapper, fallback for dev
 SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
 
+source "${SKILLRUNNER_LIB}/cron-parse.sh"
 source "${SKILLRUNNER_LIB}/schedule.sh"
 source "${SKILLRUNNER_LIB}/logging.sh"
-source "${SKILLRUNNER_LIB}/cron-parse.sh"
 source "${SKILLRUNNER_LIB}/lock.sh"
+
+# Dispatch a run outside the daemon's cgroup so it survives the
+# oneshot service exit.  Falls back to plain background on non-systemd.
+dispatch_run() {
+    local schedule_id="$1"
+    local runner="$(dirname "$0")/skillrunner-run"
+    local log_file="${SKILLRUNNER_HOME}/logs/runner.log"
+
+    if command -v systemd-run &>/dev/null; then
+        systemd-run --user --scope \
+            --unit="skillrunner-run-${schedule_id}-$(date +%s)" \
+            --description="SkillRunner run ${schedule_id}" \
+            "$runner" "$schedule_id" 2>> "$log_file" &
+    else
+        "$runner" "$schedule_id" 2>> "$log_file" &
+    fi
+}
 
 # Ensure runtime directories and default config files exist
 ensure_dirs() {
@@ -29,7 +46,7 @@ ensure_dirs() {
         echo '{"version": 1, "projects": [], "schedules": []}' | jq . > "$CONFIG_FILE"
     fi
     if [[ ! -f "$STATE_FILE" ]]; then
-        echo '{"last_wake": null, "pid": null, "version": 1}' | jq . > "$STATE_FILE"
+        echo '{"last_wake": null, "pid": null, "last_dispatched": {}, "version": 1}' | jq . > "$STATE_FILE"
     fi
     if [[ ! -f "${SKILLRUNNER_HOME}/secrets.env" ]]; then
         printf '# Add your Telegram bot token here:\n# SKILLRUNNER_TELEGRAM_TOKEN=your_bot_token_here\n' \
@@ -39,6 +56,12 @@ ensure_dirs() {
 }
 
 ensure_dirs
+
+# Migrate state.json: add last_dispatched if missing
+if [[ -f "$STATE_FILE" ]] && ! jq -e '.last_dispatched' "$STATE_FILE" &>/dev/null; then
+    _tmp=$(mktemp)
+    jq '. + {last_dispatched: {}}' "$STATE_FILE" > "$_tmp" && mv "$_tmp" "$STATE_FILE"
+fi
 
 # Disk space check (100MB minimum)
 available_kb=$(df -k "$SKILLRUNNER_HOME" | awk 'NR==2 {print $4}')
@@ -89,7 +112,7 @@ for ((i = 0; i < schedule_count; i++)); do
     schedule_id=$(echo "$schedule_json" | jq -r '.id')
     schedule_name=$(echo "$schedule_json" | jq -r '.skill // .command // "unknown"')
 
-    if cron_matches_now "$cron_expr"; then
+    if schedule_is_overdue "$schedule_id" "$cron_expr"; then
         log_daemon "Schedule ${schedule_id} (${schedule_name}) is due, dispatching"
 
         if is_locked "$schedule_id"; then
@@ -97,19 +120,31 @@ for ((i = 0; i < schedule_count; i++)); do
             continue
         fi
 
-        # Run in background so we can process other schedules concurrently
-        # Redirect stderr to log so crashes don't vanish silently
-        "$(dirname "$0")/skillrunner-run" "$schedule_id" 2>> "${SKILLRUNNER_HOME}/logs/runner.log" &
+        # Dispatch in a separate systemd scope so it survives our exit
+        dispatch_run "$schedule_id"
+
+        # Record dispatch time so we don't re-fire until the next cron window
+        now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        _tmp=$(mktemp)
+        jq --arg sid "$schedule_id" --arg ts "$now_iso" \
+            '.last_dispatched[$sid] = $ts' "$STATE_FILE" > "$_tmp" && mv "$_tmp" "$STATE_FILE"
     fi
 done
 
 # Rotate runs.jsonl if it exceeds size limit
 rotate_runs_log
 
-# Periodic cleanup: remove output files older than 30 days (check once per hour at minute 0)
-if [[ "$(date +%-M)" == "0" ]]; then
+# Periodic cleanup (once per day at midnight)
+if [[ "$(date +%-H)" == "0" && "$(date +%-M)" == "0" ]]; then
     find "${OUTPUT_DIR}" -name "*.stdout" -mtime +30 -delete 2>/dev/null || true
     find "${OUTPUT_DIR}" -name "*.stderr" -mtime +30 -delete 2>/dev/null || true
+
+    # Prune last_dispatched entries for schedules that no longer exist
+    _active_ids=$(jq -c '[.schedules[].id]' "$CONFIG_FILE")
+    _tmp=$(mktemp)
+    jq --argjson ids "$_active_ids" \
+        '.last_dispatched = (.last_dispatched | with_entries(select(.key as $k | $ids | index($k))))' \
+        "$STATE_FILE" > "$_tmp" && mv "$_tmp" "$STATE_FILE"
 fi
 
 log_daemon "Daemon check complete"

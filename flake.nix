@@ -14,14 +14,20 @@
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          runtimeDeps = [
+            pkgs.bash pkgs.jq pkgs.coreutils pkgs.gawk pkgs.findutils
+            pkgs.openssl pkgs.curl pkgs.git
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.systemd   # for systemd-run (dispatch runs in separate scopes)
+          ];
         in {
           default = pkgs.stdenv.mkDerivation {
             pname = "skillrunner";
-            version = "0.1.0";
+            version = "0.2.0";
             src = ./.;
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            buildInputs = [ pkgs.bash pkgs.jq pkgs.coreutils pkgs.gawk pkgs.findutils pkgs.openssl pkgs.curl pkgs.git ];
+            buildInputs = runtimeDeps;
 
             installPhase = ''
               mkdir -p $out/bin $out/lib $out/share/skillrunner
@@ -34,9 +40,7 @@
                 install -m755 "$script" "$out/bin/$(basename $script)"
                 wrapProgram "$out/bin/$(basename $script)" \
                   --set SKILLRUNNER_LIB "$out/lib" \
-                  --prefix PATH : "${pkgs.lib.makeBinPath [
-                    pkgs.bash pkgs.jq pkgs.coreutils pkgs.gawk pkgs.findutils pkgs.openssl pkgs.curl pkgs.git
-                  ]}"
+                  --prefix PATH : "${pkgs.lib.makeBinPath runtimeDeps}"
               done
 
               # Install skill definitions

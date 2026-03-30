@@ -47,6 +47,7 @@ in {
       Timer = {
         OnActiveSec = "1min";
         OnUnitActiveSec = "1min";
+        AccuracySec = "1s";  # prevent coalescing that drifts off cron targets
         Persistent = true;   # catch up after sleep/reboot
       };
       Install = {

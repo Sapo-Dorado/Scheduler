@@ -110,12 +110,20 @@ cmd_register() {
     count=$(jq '.schedules | length' "$project_config")
 
     for ((i = 0; i < count; i++)); do
+        local sched
+        sched=$(jq -c ".schedules[$i]" "$project_config")
+
+        # Deterministic ID: derived from project path + schedule name + skill/command.
+        # Stable across reordering, cron changes, and config tweaks.
+        local sched_label sched_skill
+        sched_label=$(echo "$sched" | jq -r '.name // ""')
+        sched_skill=$(echo "$sched" | jq -r '.skill // .command // ""')
         local sid
-        sid=$(openssl rand -hex 4)
+        sid=$(printf '%s' "${project_path}:${sched_label}:${sched_skill}" | sha256sum | cut -c1-8)
 
         tmp=$(mktemp)
         jq --arg pp "$project_path" --arg sid "$sid" --arg ts "$now_iso" \
-            --argjson sched "$(jq -c ".schedules[$i]" "$project_config")" '
+            --argjson sched "$sched" '
             .schedules += [$sched + {
                 "id": $sid,
                 "project_path": $pp,
