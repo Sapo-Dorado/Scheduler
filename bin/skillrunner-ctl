@@ -186,13 +186,43 @@ cmd_list() {
     ' "$CONFIG_FILE" | column -t -s $'\t' -N "ID,Type,Name,Cron,Schedule,Enabled,Project"
 }
 
+cmd_run() {
+    local schedule_id="${1:-}"
+    if [[ -z "$schedule_id" ]]; then
+        echo "Usage: skillrunner-ctl run <schedule_id>"
+        echo ""
+        echo "Run 'skillrunner-ctl list' to see available schedule IDs."
+        exit 1
+    fi
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "ERROR: No config file found. Register a project first."
+        exit 1
+    fi
+
+    # Verify the schedule exists
+    local match
+    match=$(jq -r ".schedules[] | select(.id == \"${schedule_id}\") | .skill // .command // \"unknown\"" "$CONFIG_FILE")
+    if [[ -z "$match" ]]; then
+        echo "ERROR: Schedule '${schedule_id}' not found."
+        echo ""
+        echo "Available schedules:"
+        cmd_list
+        exit 1
+    fi
+
+    echo "Running schedule ${schedule_id} (${match})..."
+    "$(dirname "$0")/skillrunner-run" "$schedule_id"
+}
+
 case "${1:-help}" in
     register)   cmd_register "${2:-}" ;;
     unregister) cmd_unregister "${2:-}" ;;
     status)     cmd_status ;;
     list)       cmd_list ;;
+    run)        cmd_run "${2:-}" ;;
     *)
-        echo "Usage: skillrunner-ctl {register|unregister|status|list} [path]"
+        echo "Usage: skillrunner-ctl {register|unregister|status|list|run} [args]"
         exit 1
         ;;
 esac
