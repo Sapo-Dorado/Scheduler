@@ -9,6 +9,11 @@ STATE_FILE="${SKILLRUNNER_HOME}/state.json"
 LOCKS_DIR="${SKILLRUNNER_HOME}/locks"
 OUTPUT_DIR="${SKILLRUNNER_HOME}/logs/output"
 
+# Add common NixOS/nix profile paths so we can find claude, git, etc.
+for p in "$HOME/.nix-profile/bin" "/etc/profiles/per-user/$(whoami)/bin" "/run/current-system/sw/bin" "/run/wrappers/bin"; do
+    [[ -d "$p" ]] && PATH="${p}:${PATH}"
+done
+
 # Library path set by Nix wrapper, fallback for dev
 SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
 
@@ -16,6 +21,24 @@ source "${SKILLRUNNER_LIB}/schedule.sh"
 source "${SKILLRUNNER_LIB}/logging.sh"
 source "${SKILLRUNNER_LIB}/cron-parse.sh"
 source "${SKILLRUNNER_LIB}/lock.sh"
+
+# Ensure runtime directories and default config files exist
+ensure_dirs() {
+    mkdir -p "${SKILLRUNNER_HOME}"/{logs/output,locks}
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo '{"version": 1, "projects": [], "schedules": []}' | jq . > "$CONFIG_FILE"
+    fi
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo '{"last_wake": null, "pid": null, "version": 1}' | jq . > "$STATE_FILE"
+    fi
+    if [[ ! -f "${SKILLRUNNER_HOME}/secrets.env" ]]; then
+        printf '# Add your Telegram bot token here:\n# SKILLRUNNER_TELEGRAM_TOKEN=your_bot_token_here\n' \
+            > "${SKILLRUNNER_HOME}/secrets.env"
+        chmod 600 "${SKILLRUNNER_HOME}/secrets.env"
+    fi
+}
+
+ensure_dirs
 
 # Disk space check (100MB minimum)
 available_kb=$(df -k "$SKILLRUNNER_HOME" | awk 'NR==2 {print $4}')
