@@ -29,6 +29,14 @@ in {
         Type = "oneshot";
         ExecStart = "${package}/bin/skillrunner-daemon";
         Nice = 10;
+        Environment = let
+          profilePaths = lib.concatStringsSep ":" [
+            "${config.home.profileDirectory}/bin"
+            "/etc/profiles/per-user/${config.home.username}/bin"
+            "/run/current-system/sw/bin"
+            "/run/wrappers/bin"
+          ];
+        in [ "PATH=${profilePaths}" ];
       };
     };
 
@@ -37,7 +45,7 @@ in {
         Description = "SkillRunner wake timer";
       };
       Timer = {
-        OnBootSec = "1min";
+        OnActiveSec = "1min";
         OnUnitActiveSec = "1min";
         Persistent = true;   # catch up after sleep/reboot
       };
