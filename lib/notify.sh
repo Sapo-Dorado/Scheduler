@@ -133,12 +133,21 @@ dispatch_notification() {
     template=$(echo "$schedule_json" | jq -r '.notification.template // ""')
     summary_prompt=$(echo "$schedule_json" | jq -r '.notification.summary_prompt // ""')
 
-    # Evaluate "when" condition
+    # Always send a simple alert on failure, regardless of "when" config
+    if [[ "$notify_status" == "failure" ]]; then
+        local fail_msg="❌ *${notify_skill}* failed (exit ${notify_exit_code}, ${notify_duration}s, ${notify_attempts}/${notify_max_attempts} attempts)"
+        log_daemon "NOTIFY: Sending failure alert to chat ${chat_id}"
+        if send_telegram "$chat_id" "$fail_msg"; then
+            log_daemon "NOTIFY: Failure alert sent"
+        else
+            log_daemon "NOTIFY: Failed to send failure alert"
+        fi
+        return 0
+    fi
+
+    # Evaluate "when" condition (only applies to successful runs)
     case "$when" in
         always) ;;
-        on_failure)
-            [[ "$notify_status" != "failure" ]] && return 0
-            ;;
         on_result)
             [[ -z "$notify_result_preview" ]] && return 0
             ;;
