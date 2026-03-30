@@ -9,12 +9,59 @@ CONFIG_FILE="${SKILLRUNNER_HOME}/config.json"
 RUNS_LOG="${SKILLRUNNER_HOME}/logs/runs.jsonl"
 OUTPUT_DIR="${SKILLRUNNER_HOME}/logs/output"
 
+# Add common NixOS/nix profile paths so we can find claude, git, etc.
+for p in "$HOME/.nix-profile/bin" "/etc/profiles/per-user/$(whoami)/bin" "/run/current-system/sw/bin" "/run/wrappers/bin"; do
+    [[ -d "$p" ]] && PATH="${p}:${PATH}"
+done
+
 SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
 source "${SKILLRUNNER_LIB}/logging.sh"
 source "${SKILLRUNNER_LIB}/lock.sh"
 source "${SKILLRUNNER_LIB}/notify.sh"
 
 SCHEDULE_ID="$1"
+
+# Top-level error trap: if anything fails before normal completion,
+# log the error and attempt to send a failure notification.
+_early_failure() {
+    local exit_code=$?
+    local line_no="${1:-unknown}"
+    # Log the crash — logging.sh is already sourced at this point
+    log_daemon "RUN CRASH: Schedule ${SCHEDULE_ID} failed at line ${line_no} (exit ${exit_code}) before run could complete"
+
+    # Attempt to send a failure notification using the schedule's notification config
+    local schedule_json
+    schedule_json=$(jq -c ".schedules[] | select(.id == \"${SCHEDULE_ID}\")" "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -n "$schedule_json" ]]; then
+        local has_notification
+        has_notification=$(echo "$schedule_json" | jq -e '.notification' 2>/dev/null) || true
+        if [[ -n "$has_notification" ]]; then
+            local chat_id skill_name
+            chat_id=$(echo "$schedule_json" | jq -r '.notification.chat_id')
+            skill_name=$(echo "$schedule_json" | jq -r '.skill // .command // "unknown"')
+            local token_file="${SKILLRUNNER_HOME}/secrets.env"
+            if [[ -f "$token_file" ]]; then
+                # shellcheck source=/dev/null
+                source "$token_file"
+            fi
+            local token="${SKILLRUNNER_TELEGRAM_TOKEN:-}"
+            if [[ -n "$token" && -n "$chat_id" ]]; then
+                local msg="❌ *${skill_name}* crashed during initialization (line ${line_no}, exit ${exit_code})"
+                curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+                    --data-urlencode "chat_id=$chat_id" \
+                    --data-urlencode "parse_mode=Markdown" \
+                    --data-urlencode "text=$msg" \
+                    --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1 || true
+                log_daemon "RUN CRASH: Failure notification sent to chat ${chat_id}"
+            fi
+        fi
+    fi
+
+    # Clean up lock if it was acquired
+    release_lock "$SCHEDULE_ID" 2>/dev/null || true
+}
+trap '_early_failure ${LINENO}' ERR
+
 RUN_ID=$(openssl rand -hex 8)
 
 # Read schedule config
@@ -54,6 +101,9 @@ acquire_lock "$SCHEDULE_ID" || {
     log_daemon "Failed to acquire lock for ${SCHEDULE_ID}"
     exit 1
 }
+# Replace early error trap with lock cleanup — if we got this far, normal
+# error handling (retries, notification dispatch) will handle failures.
+trap - ERR
 trap 'release_lock "$SCHEDULE_ID"' EXIT
 
 start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")

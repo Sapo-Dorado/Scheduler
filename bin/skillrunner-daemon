@@ -98,7 +98,8 @@ for ((i = 0; i < schedule_count; i++)); do
         fi
 
         # Run in background so we can process other schedules concurrently
-        "$(dirname "$0")/skillrunner-run" "$schedule_id" &
+        # Redirect stderr to log so crashes don't vanish silently
+        "$(dirname "$0")/skillrunner-run" "$schedule_id" 2>> "${SKILLRUNNER_HOME}/logs/runner.log" &
     fi
 done
 
