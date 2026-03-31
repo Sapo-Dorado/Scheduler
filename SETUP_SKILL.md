@@ -56,7 +56,7 @@ hour, and a daily skill that reads that file and summarizes findings.
 - For commands: help write the command or script if needed
 - For skills: determine where the skill comes from (see Skill Management below)
 - Timeout and retry settings
-- Notification preferences (if they've set up Telegram)
+- Notification preferences (see Notification Setup below)
 
 ### Skill Management
 
@@ -132,6 +132,49 @@ config is needed — Claude will find it automatically when the daemon
 runs from the project directory.
 
 Help the user check: `ls ~/.claude/skills/` to see what's available.
+
+### Notification Setup
+
+Ask the user if they want notifications for their schedules. If yes, help
+them set up one or both services:
+
+#### Telegram
+1. Create a bot via @BotFather on Telegram — send `/newbot` and follow prompts
+2. Copy the bot token (format: `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
+3. Write it to `~/.config/skillrunner/secrets.env`:
+   ```
+   SKILLRUNNER_TELEGRAM_TOKEN=<token>
+   ```
+4. Ensure the file is private: `chmod 600 ~/.config/skillrunner/secrets.env`
+5. Find the chat_id: have the user message the bot, then fetch:
+   `curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[0].message.chat.id'`
+6. For group notifications: add the bot to the group, send a message in the
+   group, then fetch getUpdates to find the negative group chat_id
+7. Send a test message to verify
+
+#### Discord
+1. In Discord: Server Settings > Integrations > Webhooks > New Webhook
+2. Choose the channel, copy the webhook URL
+3. The URL goes directly in the schedule config (no secrets.env needed)
+4. Test with: `curl -H "Content-Type: application/json" -d '{"content":"Test from SkillRunner"}' <WEBHOOK_URL>`
+
+#### Multiple destinations
+Schedules can notify multiple places at once using the `destinations` array:
+```json
+"notification": {
+    "destinations": [
+        {"service": "telegram", "chat_id": "123"},
+        {"service": "discord", "webhook_url": "https://discord.com/api/webhooks/..."}
+    ],
+    "when": "always",
+    "mode": "template"
+}
+```
+
+For a single destination, the flat format also works:
+```json
+"notification": { "service": "telegram", "chat_id": "123", "when": "always" }
+```
 
 ### Step 4: Create .skillrunner.json
 Write the config file to the project root.
