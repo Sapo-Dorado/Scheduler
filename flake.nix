@@ -45,7 +45,7 @@
 
               # Install skill definitions
               cp SKILL.md $out/share/skillrunner/
-              cp SETUP_SKILL.md $out/share/skillrunner/
+              cp SETUP_GUIDE.md $out/share/skillrunner/
 
               # Install service templates
               mkdir -p $out/share/skillrunner/templates

@@ -17,8 +17,8 @@ in {
     # Symlink skills into Claude Code's skill directory
     home.file.".claude/skills/schedule/SKILL.md".source =
       "${package}/share/skillrunner/SKILL.md";
-    home.file.".claude/skills/schedule-setup/SKILL.md".source =
-      "${package}/share/skillrunner/SETUP_SKILL.md";
+    home.file.".claude/skills/schedule/SETUP_GUIDE.md".source =
+      "${package}/share/skillrunner/SETUP_GUIDE.md";
 
     # Systemd user service (NixOS / Linux)
     systemd.user.services.skillrunner = lib.mkIf isLinux {
