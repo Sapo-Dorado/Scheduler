@@ -4,7 +4,7 @@ description: >
   Manage scheduled automatic execution of Claude Code skills and bash commands.
   Register projects, add/remove schedules, view logs and daemon status.
 user-invocable: true
-argument-hint: "register|unregister|add|list|remove|logs|status|enable|disable|notify-setup|discord-setup"
+argument-hint: "register|unregister|add|list|remove|run|logs|status|enable|disable|notify-setup|discord-setup"
 allowed-tools: Read, Bash, Glob, Grep
 ---
 
@@ -44,6 +44,13 @@ When registering, `skillrunner-ctl register` clones/updates each skill
 into `.claude/skills/<name>/`. The skill repo must have a `SKILL.md` at its root.
 
 ## Commands
+
+### /schedule setup
+Walk the user through setting up a new project with SkillRunner. Read the
+`SETUP_GUIDE.md` file in this skill's directory for the full setup flow,
+including how to decide between skills vs commands, skill sources, notification
+setup, and creating `.skillrunner.json`.
+Run: read `SETUP_GUIDE.md` from this skill's base directory, then follow its steps.
 
 ### /schedule register [path]
 Register a project directory with SkillRunner. Reads `.skillrunner.json` from
@@ -129,6 +136,14 @@ For multiple destinations, use the `destinations` array:
 
 Convert natural language to cron. Write to `.skillrunner.json` in the current
 project, then re-register with `skillrunner-ctl register`.
+
+### /schedule run [name or ID]
+Manually trigger a schedule immediately. Run `skillrunner-ctl list` to show
+available schedules, then run `skillrunner-ctl run <ID>` with the schedule's
+ID (the short hex ID from the first column). The run executes in the
+background using the same configuration (notifications, retries, etc.) as a
+normal scheduled execution. **Always use this instead of invoking the skill
+directly** — it ensures logging, notifications, and retries all work correctly.
 
 ### /schedule list
 Run `skillrunner-ctl list` and display all schedules.
