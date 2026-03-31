@@ -3,21 +3,20 @@
 SKILLRUNNER_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/skillrunner"
 SECRETS_FILE="${SKILLRUNNER_HOME}/secrets.env"
 
-# Load bot token
-_load_telegram_token() {
+# Load secrets from secrets.env
+_load_secrets() {
     if [[ -f "$SECRETS_FILE" ]]; then
         # shellcheck source=/dev/null
         source "$SECRETS_FILE"
     fi
-    echo "${SKILLRUNNER_TELEGRAM_TOKEN:-}"
 }
 
 # send_telegram "chat_id" "message_text"
 # Sends a Markdown-formatted message via Telegram Bot API.
 send_telegram() {
     local chat_id="$1" text="$2"
-    local token
-    token=$(_load_telegram_token)
+    _load_secrets
+    local token="${SKILLRUNNER_TELEGRAM_TOKEN:-}"
 
     if [[ -z "$token" ]]; then
         log_daemon "NOTIFY: No Telegram token configured, skipping"
@@ -36,6 +35,37 @@ send_telegram() {
 
     if [[ "$http_code" != "200" ]]; then
         log_daemon "NOTIFY: Telegram API returned HTTP ${http_code}"
+        return 1
+    fi
+
+    return 0
+}
+
+# send_discord "webhook_url" "message_text"
+# Sends a message via Discord webhook.
+send_discord() {
+    local webhook_url="$1" text="$2"
+
+    if [[ -z "$webhook_url" ]]; then
+        log_daemon "NOTIFY: No Discord webhook URL configured, skipping"
+        return 1
+    fi
+
+    # Discord webhook expects JSON with a "content" field (max 2000 chars)
+    local payload
+    payload=$(jq -cn --arg content "${text:0:2000}" '{content: $content}')
+
+    local response http_code
+    response=$(curl -s -w "\n%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "$webhook_url")
+
+    http_code=$(echo "$response" | tail -1)
+
+    # Discord returns 204 on success
+    if [[ "$http_code" != "204" && "$http_code" != "200" ]]; then
+        log_daemon "NOTIFY: Discord webhook returned HTTP ${http_code}"
         return 1
     fi
 
@@ -79,10 +109,23 @@ default_template() {
     echo "${emoji} *${notify_skill}* ${notify_status} (${notify_duration}s, \$${notify_cost})"
 }
 
-# generate_summary "summary_prompt" "result_text" — calls Claude to
+# generate_summary "summary_prompt" "result_text" "service" — calls Claude to
 # produce a phone-friendly notification message.
 generate_summary() {
-    local summary_prompt="$1" result_text="$2"
+    local summary_prompt="$1" result_text="$2" service="${3:-telegram}"
+
+    local format_instructions
+    if [[ "$service" == "discord" ]]; then
+        format_instructions="Format the response for mobile reading using Discord Markdown:
+- Use **bold** for emphasis
+- Keep it concise (under 500 characters)
+- Do not include code blocks"
+    else
+        format_instructions="Format the response for mobile reading using Telegram Markdown:
+- Use *bold* for emphasis
+- Keep it concise (under 500 characters)
+- Do not include backticks or code blocks"
+    fi
 
     local summary_output
     summary_output=$(claude -p \
@@ -90,12 +133,9 @@ generate_summary() {
         --permission-mode plan \
         --max-budget-usd 0.05 \
         --no-session-persistence \
-        "You are generating a Telegram notification message. ${summary_prompt}
+        "You are generating a notification message. ${summary_prompt}
 
-Format the response for mobile reading using Telegram Markdown:
-- Use *bold* for emphasis
-- Keep it concise (under 500 characters)
-- Do not include backticks or code blocks
+${format_instructions}
 
 Skill output to summarize:
 ${result_text}" 2>/dev/null)
@@ -113,6 +153,22 @@ ${result_text}" 2>/dev/null)
     echo "$summary"
 }
 
+# _send_notification "service" "destination" "message"
+# Routes a message to the appropriate service.
+# For telegram: destination is a chat_id
+# For discord: destination is a webhook_url
+_send_notification() {
+    local service="$1" destination="$2" message="$3"
+    case "$service" in
+        discord)
+            send_discord "$destination" "$message"
+            ;;
+        *)
+            send_telegram "$destination" "$message"
+            ;;
+    esac
+}
+
 # dispatch_notification — main entry point. Called by skillrunner-run
 # after a skill completes. Reads the notification config from the
 # schedule JSON and sends the appropriate message.
@@ -126,18 +182,27 @@ dispatch_notification() {
     local has_notification
     has_notification=$(echo "$schedule_json" | jq -e '.notification' 2>/dev/null) || return 0
 
-    local chat_id when mode template summary_prompt
-    chat_id=$(echo "$schedule_json" | jq -r '.notification.chat_id')
+    local service when mode template summary_prompt destination
+    service=$(echo "$schedule_json" | jq -r '.notification.service // "telegram"')
     when=$(echo "$schedule_json" | jq -r '.notification.when // "always"')
     mode=$(echo "$schedule_json" | jq -r '.notification.mode // "template"')
     template=$(echo "$schedule_json" | jq -r '.notification.template // ""')
     summary_prompt=$(echo "$schedule_json" | jq -r '.notification.summary_prompt // ""')
 
+    # Resolve destination based on service
+    if [[ "$service" == "discord" ]]; then
+        destination=$(echo "$schedule_json" | jq -r '.notification.webhook_url')
+    else
+        destination=$(echo "$schedule_json" | jq -r '.notification.chat_id')
+    fi
+
     # Always send a simple alert on failure, regardless of "when" config
     if [[ "$notify_status" == "failure" ]]; then
-        local fail_msg="❌ *${notify_skill}* failed (exit ${notify_exit_code}, ${notify_duration}s, ${notify_attempts}/${notify_max_attempts} attempts)"
-        log_daemon "NOTIFY: Sending failure alert to chat ${chat_id}"
-        if send_telegram "$chat_id" "$fail_msg"; then
+        local bold_l="*" bold_r="*"
+        [[ "$service" == "discord" ]] && bold_l="**" && bold_r="**"
+        local fail_msg="❌ ${bold_l}${notify_skill}${bold_r} failed (exit ${notify_exit_code}, ${notify_duration}s, ${notify_attempts}/${notify_max_attempts} attempts)"
+        log_daemon "NOTIFY: Sending failure alert via ${service}"
+        if _send_notification "$service" "$destination" "$fail_msg"; then
             log_daemon "NOTIFY: Failure alert sent"
         else
             log_daemon "NOTIFY: Failed to send failure alert"
@@ -173,7 +238,7 @@ dispatch_notification() {
                 message=$(default_template)
             else
                 log_daemon "NOTIFY: Generating summary via Claude"
-                message=$(generate_summary "$summary_prompt" "$notify_result_full")
+                message=$(generate_summary "$summary_prompt" "$notify_result_full" "$service")
             fi
             ;;
         *)
@@ -183,8 +248,8 @@ dispatch_notification() {
     esac
 
     # Send it
-    log_daemon "NOTIFY: Sending to chat ${chat_id} (mode=${mode})"
-    if send_telegram "$chat_id" "$message"; then
+    log_daemon "NOTIFY: Sending via ${service} (mode=${mode})"
+    if _send_notification "$service" "$destination" "$message"; then
         log_daemon "NOTIFY: Sent successfully"
     else
         log_daemon "NOTIFY: Failed to send"

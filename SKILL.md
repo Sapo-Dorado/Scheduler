@@ -4,7 +4,7 @@ description: >
   Manage scheduled automatic execution of Claude Code skills and bash commands.
   Register projects, add/remove schedules, view logs and daemon status.
 user-invocable: true
-argument-hint: "register|unregister|add|list|remove|logs|status|enable|disable|notify-setup"
+argument-hint: "register|unregister|add|list|remove|logs|status|enable|disable|notify-setup|discord-setup"
 allowed-tools: Read, Bash, Glob, Grep
 ---
 
@@ -73,8 +73,10 @@ Then for both:
 - **Retry** (optional) — max attempts and delay
 
 Then notification (optional):
-- **Notify?** — whether to send Telegram notifications (default: no)
-- **Chat ID** — who to notify
+- **Notify?** — whether to send notifications (default: no)
+- **Service** — `telegram` (default) or `discord`
+- If telegram: **Chat ID** — who to notify (requires bot token in secrets.env)
+- If discord: **Webhook URL** — Discord channel webhook URL
 - **When** — always / on_failure / on_result
 - **Mode** — template (free) or summary (costs ~$0.01-0.05 per notification)
 - **Template** (if template mode) — custom template or use default
@@ -109,6 +111,14 @@ Guide the user through Telegram notification setup:
    fetch `https://api.telegram.org/bot<TOKEN>/getUpdates` via curl)
 5. For group notifications: explain adding the bot to a group
 6. Send a test message to verify the setup works
+
+### /schedule discord-setup
+Guide the user through Discord webhook notification setup:
+1. Explain how to create a webhook in Discord (Server Settings > Integrations > Webhooks)
+2. Ask for the webhook URL
+3. The webhook URL goes directly in the schedule's `notification.webhook_url` field
+   (no secrets.env entry needed — it's per-schedule)
+4. Send a test message to verify: `curl -H "Content-Type: application/json" -d '{"content":"Test from SkillRunner"}' <WEBHOOK_URL>`
 
 ## Installation Check
 Before any command, verify skillrunner-ctl is on PATH. If not, tell the user
