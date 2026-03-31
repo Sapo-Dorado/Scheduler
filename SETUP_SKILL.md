@@ -158,6 +158,31 @@ them set up one or both services:
 3. The URL goes directly in the schedule config (no secrets.env needed)
 4. Test with: `curl -H "Content-Type: application/json" -d '{"content":"Test from SkillRunner"}' <WEBHOOK_URL>`
 
+#### Template Variables
+
+When using `"mode": "template"`, the following variables are available for use in
+the `"template"` field. **Only these variables are supported** — any other `${...}`
+syntax will be sent literally, not interpolated.
+
+| Variable | Description |
+|----------|-------------|
+| `${name}` | Schedule name (skill or command name) |
+| `${status}` | `"success"` or `"failure"` |
+| `${exit_code}` | Exit code (0 = success) |
+| `${duration}` | Execution time in seconds |
+| `${cost}` | USD cost of API calls (skills only; 0 for commands) |
+| `${attempts}` | Current attempt number |
+| `${max_attempts}` | Maximum retry attempts configured |
+| `${project_path}` | Working directory of the schedule |
+| `${result_preview}` | First 4096 characters of command/skill output |
+| `${timestamp}` | ISO 8601 completion timestamp |
+
+**Default template** (used when no custom template is provided):
+- Success: `✅ *${name}* success (${duration}s, $${cost})`
+- Failure: `❌ *${name}* failure (${duration}s, $${cost})`
+
+**Example:** To send just the command output, use `"template": "${result_preview}"`.
+
 #### Multiple destinations
 Schedules can notify multiple places at once using the `destinations` array:
 ```json

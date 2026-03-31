@@ -80,8 +80,36 @@ Then notification (optional):
   - If discord: **Webhook URL** — Discord channel webhook URL
 - **When** — always / on_failure / on_result
 - **Mode** — template (free) or summary (costs ~$0.01-0.05 per notification)
-- **Template** (if template mode) — custom template or use default
+- **Template** (if template mode) — custom template using variables below, or omit for default
 - **Summary prompt** (if summary mode) — what to tell Claude about summarizing
+
+#### Template Variables
+
+When using `"mode": "template"`, the following variables are available:
+
+| Variable | Description |
+|----------|-------------|
+| `${name}` | Schedule name (skill or command name) |
+| `${status}` | `"success"` or `"failure"` |
+| `${exit_code}` | Exit code (0 = success) |
+| `${duration}` | Execution time in seconds |
+| `${cost}` | USD cost of API calls (skills only; 0 for commands) |
+| `${attempts}` | Current attempt number |
+| `${max_attempts}` | Maximum retry attempts configured |
+| `${project_path}` | Working directory of the schedule |
+| `${result_preview}` | First 4096 characters of command/skill output |
+| `${timestamp}` | ISO 8601 completion timestamp |
+
+**Default template** (used when no custom template is provided):
+- Success: `✅ *${name}* success (${duration}s, $${cost})`
+- Failure: `❌ *${name}* failure (${duration}s, $${cost})`
+
+**Example custom template:**
+```json
+"template": "🕐 ${result_preview}"
+```
+
+**Important:** Only use variables from the table above. Any other `${...}` syntax will be sent literally, not interpolated.
 
 For a single destination, either format works:
 ```json
