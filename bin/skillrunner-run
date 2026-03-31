@@ -36,40 +36,58 @@ _early_failure() {
         local has_notification
         has_notification=$(echo "$schedule_json" | jq -e '.notification' 2>/dev/null) || true
         if [[ -n "$has_notification" ]]; then
-            local notify_service skill_name
-            notify_service=$(echo "$schedule_json" | jq -r '.notification.service // "telegram"')
+            local skill_name
             skill_name=$(echo "$schedule_json" | jq -r '.skill // .command // "unknown"')
 
-            if [[ "$notify_service" == "discord" ]]; then
-                local webhook_url
-                webhook_url=$(echo "$schedule_json" | jq -r '.notification.webhook_url')
-                if [[ -n "$webhook_url" ]]; then
+            # Build destinations array (supports both legacy and multi-destination)
+            local dests
+            dests=$(echo "$schedule_json" | jq -c '
+                .notification |
+                if .destinations then
+                    [.destinations[] | {
+                        service: (.service // "telegram"),
+                        destination: (if .service == "discord" then .webhook_url else .chat_id end)
+                    }]
+                else
+                    [{
+                        service: (.service // "telegram"),
+                        destination: (if (.service // "telegram") == "discord" then .webhook_url else .chat_id end)
+                    }]
+                end
+            ' 2>/dev/null || echo '[]')
+
+            local dest_count
+            dest_count=$(echo "$dests" | jq 'length')
+
+            # Load secrets once for potential Telegram sends
+            local token_file="${SKILLRUNNER_HOME}/secrets.env"
+            if [[ -f "$token_file" ]]; then
+                # shellcheck source=/dev/null
+                source "$token_file"
+            fi
+            local token="${SKILLRUNNER_TELEGRAM_TOKEN:-}"
+
+            local i svc dest
+            for (( i = 0; i < dest_count; i++ )); do
+                svc=$(echo "$dests" | jq -r ".[$i].service")
+                dest=$(echo "$dests" | jq -r ".[$i].destination")
+                if [[ "$svc" == "discord" && -n "$dest" ]]; then
                     local msg="❌ **${skill_name}** crashed during initialization (line ${line_no}, exit ${exit_code})"
                     local payload
                     payload=$(jq -cn --arg content "$msg" '{content: $content}')
                     curl -s -X POST -H "Content-Type: application/json" \
-                        -d "$payload" "$webhook_url" >/dev/null 2>&1 || true
+                        -d "$payload" "$dest" >/dev/null 2>&1 || true
                     log_daemon "RUN CRASH: Failure notification sent via Discord"
-                fi
-            else
-                local chat_id
-                chat_id=$(echo "$schedule_json" | jq -r '.notification.chat_id')
-                local token_file="${SKILLRUNNER_HOME}/secrets.env"
-                if [[ -f "$token_file" ]]; then
-                    # shellcheck source=/dev/null
-                    source "$token_file"
-                fi
-                local token="${SKILLRUNNER_TELEGRAM_TOKEN:-}"
-                if [[ -n "$token" && -n "$chat_id" ]]; then
+                elif [[ -n "$token" && -n "$dest" ]]; then
                     local msg="❌ *${skill_name}* crashed during initialization (line ${line_no}, exit ${exit_code})"
                     curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-                        --data-urlencode "chat_id=$chat_id" \
+                        --data-urlencode "chat_id=$dest" \
                         --data-urlencode "parse_mode=Markdown" \
                         --data-urlencode "text=$msg" \
                         --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1 || true
-                    log_daemon "RUN CRASH: Failure notification sent to chat ${chat_id}"
+                    log_daemon "RUN CRASH: Failure notification sent to chat ${dest}"
                 fi
-            fi
+            done
         fi
     fi
 

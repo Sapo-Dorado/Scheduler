@@ -74,13 +74,30 @@ Then for both:
 
 Then notification (optional):
 - **Notify?** — whether to send notifications (default: no)
-- **Service** — `telegram` (default) or `discord`
-- If telegram: **Chat ID** — who to notify (requires bot token in secrets.env)
-- If discord: **Webhook URL** — Discord channel webhook URL
+- **Destinations** — one or more notification targets. Ask how many and for each:
+  - **Service** — `telegram` (default) or `discord`
+  - If telegram: **Chat ID** — who to notify (requires bot token in secrets.env)
+  - If discord: **Webhook URL** — Discord channel webhook URL
 - **When** — always / on_failure / on_result
 - **Mode** — template (free) or summary (costs ~$0.01-0.05 per notification)
 - **Template** (if template mode) — custom template or use default
 - **Summary prompt** (if summary mode) — what to tell Claude about summarizing
+
+For a single destination, either format works:
+```json
+"notification": { "service": "telegram", "chat_id": "123", "when": "always" }
+```
+For multiple destinations, use the `destinations` array:
+```json
+"notification": {
+    "destinations": [
+        {"service": "telegram", "chat_id": "123"},
+        {"service": "discord", "webhook_url": "https://discord.com/api/webhooks/..."}
+    ],
+    "when": "always",
+    "mode": "template"
+}
+```
 
 Convert natural language to cron. Write to `.skillrunner.json` in the current
 project, then re-register with `skillrunner-ctl register`.

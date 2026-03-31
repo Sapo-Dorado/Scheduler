@@ -169,12 +169,64 @@ _send_notification() {
     esac
 }
 
+# _resolve_destinations "schedule_json"
+# Returns a JSON array of {service, destination} objects.
+# Supports both the new "destinations" array and legacy single-destination fields.
+_resolve_destinations() {
+    local schedule_json="$1"
+    echo "$schedule_json" | jq -c '
+        .notification |
+        if .destinations then
+            [.destinations[] | {
+                service: (.service // "telegram"),
+                destination: (if .service == "discord" then .webhook_url else .chat_id end)
+            }]
+        else
+            [{
+                service: (.service // "telegram"),
+                destination: (if (.service // "telegram") == "discord" then .webhook_url else .chat_id end)
+            }]
+        end
+    '
+}
+
+# _generate_message "mode" "template" "summary_prompt" "service"
+# Generates the notification message for a given service.
+_generate_message() {
+    local mode="$1" template="$2" summary_prompt="$3" service="$4"
+    local message
+    case "$mode" in
+        template)
+            if [[ -n "$template" ]]; then
+                message=$(expand_template "$template")
+            else
+                message=$(default_template)
+            fi
+            ;;
+        summary)
+            if [[ -z "$summary_prompt" ]]; then
+                log_daemon "NOTIFY: summary mode requires summary_prompt, falling back to template"
+                message=$(default_template)
+            else
+                log_daemon "NOTIFY: Generating summary via Claude (${service})"
+                message=$(generate_summary "$summary_prompt" "$notify_result_full" "$service")
+            fi
+            ;;
+        *)
+            log_daemon "NOTIFY: Unknown mode '${mode}', skipping"
+            return 0
+            ;;
+    esac
+    echo "$message"
+}
+
 # dispatch_notification — main entry point. Called by skillrunner-run
 # after a skill completes. Reads the notification config from the
 # schedule JSON and sends the appropriate message.
 #
-# Arguments: schedule_json, status, exit_code, duration, cost,
-#            attempts, max_attempts, result_text, timestamp
+# Supports both single-destination (legacy) and multi-destination configs:
+#   Legacy:  { "notification": { "service": "telegram", "chat_id": "123", ... } }
+#   Multi:   { "notification": { "destinations": [...], "when": "always", ... } }
 dispatch_notification() {
     local schedule_json="$1"
 
@@ -182,31 +234,41 @@ dispatch_notification() {
     local has_notification
     has_notification=$(echo "$schedule_json" | jq -e '.notification' 2>/dev/null) || return 0
 
-    local service when mode template summary_prompt destination
-    service=$(echo "$schedule_json" | jq -r '.notification.service // "telegram"')
+    local when mode template summary_prompt
     when=$(echo "$schedule_json" | jq -r '.notification.when // "always"')
     mode=$(echo "$schedule_json" | jq -r '.notification.mode // "template"')
     template=$(echo "$schedule_json" | jq -r '.notification.template // ""')
     summary_prompt=$(echo "$schedule_json" | jq -r '.notification.summary_prompt // ""')
 
-    # Resolve destination based on service
-    if [[ "$service" == "discord" ]]; then
-        destination=$(echo "$schedule_json" | jq -r '.notification.webhook_url')
-    else
-        destination=$(echo "$schedule_json" | jq -r '.notification.chat_id')
+    # Build destinations array
+    local destinations_json
+    destinations_json=$(_resolve_destinations "$schedule_json")
+    local dest_count
+    dest_count=$(echo "$destinations_json" | jq 'length')
+
+    if [[ "$dest_count" -eq 0 ]]; then
+        log_daemon "NOTIFY: No destinations configured, skipping"
+        return 0
     fi
+
+    log_daemon "NOTIFY: ${dest_count} destination(s) configured"
 
     # Always send a simple alert on failure, regardless of "when" config
     if [[ "$notify_status" == "failure" ]]; then
-        local bold_l="*" bold_r="*"
-        [[ "$service" == "discord" ]] && bold_l="**" && bold_r="**"
-        local fail_msg="❌ ${bold_l}${notify_skill}${bold_r} failed (exit ${notify_exit_code}, ${notify_duration}s, ${notify_attempts}/${notify_max_attempts} attempts)"
-        log_daemon "NOTIFY: Sending failure alert via ${service}"
-        if _send_notification "$service" "$destination" "$fail_msg"; then
-            log_daemon "NOTIFY: Failure alert sent"
-        else
-            log_daemon "NOTIFY: Failed to send failure alert"
-        fi
+        local i service destination
+        for (( i = 0; i < dest_count; i++ )); do
+            service=$(echo "$destinations_json" | jq -r ".[$i].service")
+            destination=$(echo "$destinations_json" | jq -r ".[$i].destination")
+            local bold_l="*" bold_r="*"
+            [[ "$service" == "discord" ]] && bold_l="**" && bold_r="**"
+            local fail_msg="❌ ${bold_l}${notify_skill}${bold_r} failed (exit ${notify_exit_code}, ${notify_duration}s, ${notify_attempts}/${notify_max_attempts} attempts)"
+            log_daemon "NOTIFY: Sending failure alert via ${service}"
+            if _send_notification "$service" "$destination" "$fail_msg"; then
+                log_daemon "NOTIFY: Failure alert sent (${service})"
+            else
+                log_daemon "NOTIFY: Failed to send failure alert (${service})"
+            fi
+        done
         return 0
     fi
 
@@ -222,36 +284,33 @@ dispatch_notification() {
             ;;
     esac
 
-    # Generate message based on mode
-    local message
-    case "$mode" in
-        template)
-            if [[ -n "$template" ]]; then
-                message=$(expand_template "$template")
-            else
-                message=$(default_template)
-            fi
-            ;;
-        summary)
-            if [[ -z "$summary_prompt" ]]; then
-                log_daemon "NOTIFY: summary mode requires summary_prompt, falling back to template"
-                message=$(default_template)
-            else
-                log_daemon "NOTIFY: Generating summary via Claude"
-                message=$(generate_summary "$summary_prompt" "$notify_result_full" "$service")
-            fi
-            ;;
-        *)
-            log_daemon "NOTIFY: Unknown mode '${mode}', skipping"
-            return 0
-            ;;
-    esac
+    # Generate message and send to each destination.
+    # Cache summary per service type to avoid redundant Claude calls.
+    local _summary_telegram="" _summary_discord="" _summary_cached_telegram=0 _summary_cached_discord=0
+    local i service destination message
+    for (( i = 0; i < dest_count; i++ )); do
+        service=$(echo "$destinations_json" | jq -r ".[$i].service")
+        destination=$(echo "$destinations_json" | jq -r ".[$i].destination")
 
-    # Send it
-    log_daemon "NOTIFY: Sending via ${service} (mode=${mode})"
-    if _send_notification "$service" "$destination" "$message"; then
-        log_daemon "NOTIFY: Sent successfully"
-    else
-        log_daemon "NOTIFY: Failed to send"
-    fi
+        if [[ "$mode" == "summary" && -n "$summary_prompt" ]]; then
+            # Use cached summary if available for this service type
+            local cache_var="_summary_${service}" cached_var="_summary_cached_${service}"
+            if [[ "${!cached_var}" -eq 1 ]]; then
+                message="${!cache_var}"
+            else
+                message=$(_generate_message "$mode" "$template" "$summary_prompt" "$service")
+                printf -v "$cache_var" '%s' "$message"
+                printf -v "$cached_var" '%s' "1"
+            fi
+        else
+            message=$(_generate_message "$mode" "$template" "$summary_prompt" "$service")
+        fi
+
+        log_daemon "NOTIFY: Sending via ${service} (mode=${mode})"
+        if _send_notification "$service" "$destination" "$message"; then
+            log_daemon "NOTIFY: Sent successfully (${service})"
+        else
+            log_daemon "NOTIFY: Failed to send (${service})"
+        fi
+    done
 }
