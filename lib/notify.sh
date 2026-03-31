@@ -105,7 +105,7 @@ ${result_text}" 2>/dev/null)
     summary=$(echo "$summary_output" | jq -r '.result // ""' 2>/dev/null)
 
     if [[ -z "$summary" ]]; then
-        # Fallback to default template if summary generation fails
+        log_daemon "NOTIFY: Summary generation failed (empty result from Claude), falling back to default template"
         default_template
         return
     fi
@@ -173,7 +173,7 @@ dispatch_notification() {
                 message=$(default_template)
             else
                 log_daemon "NOTIFY: Generating summary via Claude"
-                message=$(generate_summary "$summary_prompt" "$notify_result_preview")
+                message=$(generate_summary "$summary_prompt" "$notify_result_full")
             fi
             ;;
         *)
