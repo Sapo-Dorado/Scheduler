@@ -109,43 +109,41 @@ default_template() {
     echo "${emoji} *${notify_skill}* ${notify_status} (${notify_duration}s, \$${notify_cost})"
 }
 
-# generate_summary "summary_prompt" "result_text" "service" — calls Claude to
-# produce a phone-friendly notification message.
+# generate_summary "summary_prompt" "result_text" — calls Claude once to
+# produce a phone-friendly notification message (plain text, no service-specific formatting).
 generate_summary() {
-    local summary_prompt="$1" result_text="$2" service="${3:-telegram}"
-
-    local format_instructions
-    if [[ "$service" == "discord" ]]; then
-        format_instructions="Format the response for mobile reading using Discord Markdown:
-- Use **bold** for emphasis
-- Keep it concise (under 500 characters)
-- Do not include code blocks"
-    else
-        format_instructions="Format the response for mobile reading using Telegram Markdown:
-- Use *bold* for emphasis
-- Keep it concise (under 500 characters)
-- Do not include backticks or code blocks"
-    fi
+    local summary_prompt="$1" result_text="$2"
 
     local summary_output
     summary_output=$(claude -p \
         --output-format json \
         --permission-mode plan \
-        --max-budget-usd 0.05 \
+        --max-budget-usd 0.25 \
         --no-session-persistence \
         "You are generating a notification message. ${summary_prompt}
 
-${format_instructions}
+Keep it concise (under 500 characters). Use plain text only — no markdown, no code blocks, no backticks, no bold formatting.
 
 Skill output to summarize:
 ${result_text}" 2>/dev/null)
+
+    # Check for errors in the response
+    local is_error
+    is_error=$(echo "$summary_output" | jq -r '.is_error // false' 2>/dev/null)
+    if [[ "$is_error" == "true" ]]; then
+        log_daemon "NOTIFY: Claude returned an error, falling back to default template"
+        default_template
+        return
+    fi
 
     # Extract result from JSON response
     local summary
     summary=$(echo "$summary_output" | jq -r '.result // ""' 2>/dev/null)
 
     if [[ -z "$summary" ]]; then
-        log_daemon "NOTIFY: Summary generation failed (empty result from Claude), falling back to default template"
+        local subtype
+        subtype=$(echo "$summary_output" | jq -r '.subtype // "unknown"' 2>/dev/null)
+        log_daemon "NOTIFY: Summary generation failed (subtype=${subtype}), falling back to default template"
         default_template
         return
     fi
@@ -208,8 +206,8 @@ _generate_message() {
                 log_daemon "NOTIFY: summary mode requires summary_prompt, falling back to template"
                 message=$(default_template)
             else
-                log_daemon "NOTIFY: Generating summary via Claude (${service})"
-                message=$(generate_summary "$summary_prompt" "$notify_result_full" "$service")
+                log_daemon "NOTIFY: Generating summary via Claude"
+                message=$(generate_summary "$summary_prompt" "$notify_result_full")
             fi
             ;;
         *)
@@ -284,27 +282,14 @@ dispatch_notification() {
             ;;
     esac
 
-    # Generate message and send to each destination.
-    # Cache summary per service type to avoid redundant Claude calls.
-    local _summary_telegram="" _summary_discord="" _summary_cached_telegram=0 _summary_cached_discord=0
-    local i service destination message
+    # Generate message once and send to all destinations.
+    local message
+    message=$(_generate_message "$mode" "$template" "$summary_prompt" "")
+
+    local i service destination
     for (( i = 0; i < dest_count; i++ )); do
         service=$(echo "$destinations_json" | jq -r ".[$i].service")
         destination=$(echo "$destinations_json" | jq -r ".[$i].destination")
-
-        if [[ "$mode" == "summary" && -n "$summary_prompt" ]]; then
-            # Use cached summary if available for this service type
-            local cache_var="_summary_${service}" cached_var="_summary_cached_${service}"
-            if [[ "${!cached_var}" -eq 1 ]]; then
-                message="${!cache_var}"
-            else
-                message=$(_generate_message "$mode" "$template" "$summary_prompt" "$service")
-                printf -v "$cache_var" '%s' "$message"
-                printf -v "$cached_var" '%s' "1"
-            fi
-        else
-            message=$(_generate_message "$mode" "$template" "$summary_prompt" "$service")
-        fi
 
         log_daemon "NOTIFY: Sending via ${service} (mode=${mode})"
         if _send_notification "$service" "$destination" "$message"; then
