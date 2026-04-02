@@ -117,6 +117,7 @@ args=""
 command=""
 permission_mode="plan"
 max_budget="0.50"
+use_chrome="false"
 
 if [[ "$run_type" == "skill" ]]; then
     skill=$(echo "$schedule_json" | jq -r '.skill')
@@ -140,6 +141,23 @@ acquire_lock "$SCHEDULE_ID" || {
 # error handling (retries, notification dispatch) will handle failures.
 trap - ERR
 trap 'release_lock "$SCHEDULE_ID"' EXIT
+
+# If this is a Chrome skill, ensure a browser is running
+if [[ "$use_chrome" == "true" ]]; then
+    if ! pgrep -f "brave" &>/dev/null && ! pgrep -f "google-chrome" &>/dev/null && ! pgrep -f "chromium" &>/dev/null; then
+        log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Brave"
+        nohup brave &>/dev/null &
+        # Wait for browser to fully start and extension to connect
+        sleep 15
+        if ! pgrep -f "brave" &>/dev/null; then
+            log_daemon "RUN ${RUN_ID}: ERROR: Failed to launch browser for Chrome skill"
+            exit 1
+        fi
+        log_daemon "RUN ${RUN_ID}: Browser launched successfully"
+    else
+        log_daemon "RUN ${RUN_ID}: Chrome skill — browser already running"
+    fi
+fi
 
 start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 start_epoch=$(date +%s)

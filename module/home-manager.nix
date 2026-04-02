@@ -36,7 +36,10 @@ in {
             "/run/current-system/sw/bin"
             "/run/wrappers/bin"
           ];
-        in [ "PATH=${profilePaths}" ];
+        in [
+          "PATH=${profilePaths}"
+          "DISPLAY=:0"
+        ];
       };
     };
 
