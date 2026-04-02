@@ -18,7 +18,8 @@
             pkgs.bash pkgs.jq pkgs.coreutils pkgs.gawk pkgs.findutils
             pkgs.openssl pkgs.curl pkgs.git
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-            pkgs.systemd   # for systemd-run (dispatch runs in separate scopes)
+            pkgs.systemd           # for systemd-run (dispatch runs in separate scopes)
+            pkgs.xorg.xdpyinfo     # for Chrome skill display reachability check
           ];
         in {
           default = pkgs.stdenv.mkDerivation {
