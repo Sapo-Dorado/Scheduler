@@ -123,6 +123,7 @@ if [[ "$run_type" == "skill" ]]; then
     args=$(echo "$schedule_json" | jq -r '.args // ""')
     permission_mode=$(echo "$schedule_json" | jq -r '.permission_mode // "plan"')
     max_budget=$(echo "$schedule_json" | jq -r '.max_budget_usd // 0.50')
+    use_chrome=$(echo "$schedule_json" | jq -r '.chrome // false')
 elif [[ "$run_type" == "command" ]]; then
     command=$(echo "$schedule_json" | jq -r '.command')
 fi
@@ -161,6 +162,8 @@ while (( attempt < max_attempts )); do
         [[ -n "$args" ]] && prompt="/${skill} ${args}"
 
         # Invoke Claude Code from the project directory
+        chrome_flag=""
+        [[ "$use_chrome" == "true" ]] && chrome_flag="--chrome"
         (
             cd "$workdir" 2>/dev/null || cd "$HOME"
             timeout "${timeout_secs}" \
@@ -169,6 +172,7 @@ while (( attempt < max_attempts )); do
                     --permission-mode "$permission_mode" \
                     --max-budget-usd "$max_budget" \
                     --no-session-persistence \
+                    $chrome_flag \
                     "$prompt"
         ) > "$stdout_file" 2> "$stderr_file" < /dev/null
         exit_code=$?
