@@ -70,7 +70,7 @@ If skill:
 3. **Arguments** (optional)
 4. **Chrome** — does this skill need Chrome browser? (default: no). If yes, set `"chrome": true`.
    - **Important:** Before enabling, check for a graphical display by running:
-     `[ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ] && echo "Display available" || echo "No display"`
+     `[ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ] || [ "$(uname)" = "Darwin" ] && echo "Display available" || echo "No display"`
    - If no display is available, warn the user: "Chrome skills require a graphical
      desktop session (DISPLAY or WAYLAND_DISPLAY). They will be silently skipped
      when no display is available — e.g., on a headless server or pure SSH session.
