@@ -143,31 +143,32 @@ trap - ERR
 trap 'release_lock "$SCHEDULE_ID"' EXIT
 
 # If this is a Chrome skill, ensure a graphical display and browser are available
+chrome_preflight_error=""
 if [[ "$use_chrome" == "true" ]]; then
     # Check for a graphical display
     if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-        log_daemon "RUN ${RUN_ID}: SKIP: Chrome skill '${run_name}' requires a graphical display but none is available (no DISPLAY or WAYLAND_DISPLAY set)"
-        exit 0
-    fi
-
+        chrome_preflight_error="Chrome skill requires a graphical display but no DISPLAY or WAYLAND_DISPLAY is set. This machine may be running headless or accessed via SSH without a desktop session."
+        log_daemon "RUN ${RUN_ID}: ERROR: ${chrome_preflight_error}"
     # Verify the display is actually reachable (X server running)
-    if [[ -n "${DISPLAY:-}" ]] && ! xdpyinfo &>/dev/null 2>&1; then
-        log_daemon "RUN ${RUN_ID}: SKIP: Chrome skill '${run_name}' requires a graphical display but DISPLAY=${DISPLAY} is not reachable"
-        exit 0
-    fi
-
-    if ! pgrep -f "google-chrome" &>/dev/null; then
-        log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Google Chrome"
-        nohup google-chrome-stable &>/dev/null &
-        # Wait for browser to fully start and extension to connect
-        sleep 15
-        if ! pgrep -f "google-chrome" &>/dev/null; then
-            log_daemon "RUN ${RUN_ID}: ERROR: Failed to launch browser for Chrome skill"
-            exit 1
-        fi
-        log_daemon "RUN ${RUN_ID}: Browser launched successfully"
+    elif [[ -n "${DISPLAY:-}" ]] && ! xdpyinfo &>/dev/null 2>&1; then
+        chrome_preflight_error="Chrome skill requires a graphical display but DISPLAY=${DISPLAY} is not reachable. The X server may not be running."
+        log_daemon "RUN ${RUN_ID}: ERROR: ${chrome_preflight_error}"
     else
-        log_daemon "RUN ${RUN_ID}: Chrome skill — browser already running"
+        # Display is available, ensure browser is running
+        if ! pgrep -f "google-chrome" &>/dev/null; then
+            log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Google Chrome"
+            nohup google-chrome-stable &>/dev/null &
+            # Wait for browser to fully start and extension to connect
+            sleep 15
+            if ! pgrep -f "google-chrome" &>/dev/null; then
+                chrome_preflight_error="Failed to launch Google Chrome for Chrome skill."
+                log_daemon "RUN ${RUN_ID}: ERROR: ${chrome_preflight_error}"
+            else
+                log_daemon "RUN ${RUN_ID}: Browser launched successfully"
+            fi
+        else
+            log_daemon "RUN ${RUN_ID}: Chrome skill — browser already running"
+        fi
     fi
 fi
 
@@ -186,6 +187,15 @@ while (( attempt < max_attempts )); do
     log_daemon "RUN ${RUN_ID}: Attempt ${attempt}/${max_attempts}"
 
     set +e
+    # If Chrome preflight failed, skip execution entirely
+    if [[ -n "$chrome_preflight_error" ]]; then
+        echo "ERROR: ${chrome_preflight_error}" > "$stdout_file"
+        echo "" > "$stderr_file"
+        exit_code=1
+        set -e
+        break
+    fi
+
     if [[ "$run_type" == "skill" ]]; then
         # Build skill prompt (no `local` — we're at top level)
         prompt="/${skill}"
