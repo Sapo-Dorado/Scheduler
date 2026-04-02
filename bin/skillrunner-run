@@ -144,12 +144,12 @@ trap 'release_lock "$SCHEDULE_ID"' EXIT
 
 # If this is a Chrome skill, ensure a browser is running
 if [[ "$use_chrome" == "true" ]]; then
-    if ! pgrep -f "brave" &>/dev/null && ! pgrep -f "google-chrome" &>/dev/null && ! pgrep -f "chromium" &>/dev/null; then
-        log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Brave"
-        nohup brave &>/dev/null &
+    if ! pgrep -f "google-chrome" &>/dev/null; then
+        log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Google Chrome"
+        nohup google-chrome-stable &>/dev/null &
         # Wait for browser to fully start and extension to connect
         sleep 15
-        if ! pgrep -f "brave" &>/dev/null; then
+        if ! pgrep -f "google-chrome" &>/dev/null; then
             log_daemon "RUN ${RUN_ID}: ERROR: Failed to launch browser for Chrome skill"
             exit 1
         fi
