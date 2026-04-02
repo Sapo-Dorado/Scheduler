@@ -68,8 +68,17 @@ Interactively create a schedule. First ask:
 If skill:
 2. **Skill name** — which slash command to run (e.g., `concert-search`)
 3. **Arguments** (optional)
-4. **Permission mode** (optional) — `plan` (default), `acceptEdits`, `bypassPermissions`
-5. **Budget per run** (optional) — default $0.50
+4. **Chrome** — does this skill need Chrome browser? (default: no). If yes, set `"chrome": true`.
+   - **Important:** Before enabling, check for a graphical display by running:
+     `xdpyinfo &>/dev/null && echo "Display available" || echo "No display"`
+   - If no display is available, warn the user: "Chrome skills require a graphical
+     desktop session (DISPLAY or WAYLAND_DISPLAY). They will be silently skipped
+     when no display is available — e.g., on a headless server or pure SSH session.
+     The skill will run normally when a graphical session is active."
+   - Chrome skills will automatically launch Google Chrome if it's not already
+     running (requires the Claude in Chrome extension to be installed).
+5. **Permission mode** (optional) — `plan` (default), `acceptEdits`, `bypassPermissions`
+6. **Budget per run** (optional) — default $0.50
 
 If command:
 2. **Command** — the bash command to run (e.g., `./scripts/backup.sh`)

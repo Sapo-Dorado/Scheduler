@@ -142,8 +142,20 @@ acquire_lock "$SCHEDULE_ID" || {
 trap - ERR
 trap 'release_lock "$SCHEDULE_ID"' EXIT
 
-# If this is a Chrome skill, ensure a browser is running
+# If this is a Chrome skill, ensure a graphical display and browser are available
 if [[ "$use_chrome" == "true" ]]; then
+    # Check for a graphical display
+    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        log_daemon "RUN ${RUN_ID}: SKIP: Chrome skill '${run_name}' requires a graphical display but none is available (no DISPLAY or WAYLAND_DISPLAY set)"
+        exit 0
+    fi
+
+    # Verify the display is actually reachable (X server running)
+    if [[ -n "${DISPLAY:-}" ]] && ! xdpyinfo &>/dev/null 2>&1; then
+        log_daemon "RUN ${RUN_ID}: SKIP: Chrome skill '${run_name}' requires a graphical display but DISPLAY=${DISPLAY} is not reachable"
+        exit 0
+    fi
+
     if ! pgrep -f "google-chrome" &>/dev/null; then
         log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Google Chrome"
         nohup google-chrome-stable &>/dev/null &
