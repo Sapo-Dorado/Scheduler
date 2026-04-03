@@ -18,6 +18,7 @@ SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
 source "${SKILLRUNNER_LIB}/logging.sh"
 source "${SKILLRUNNER_LIB}/lock.sh"
 source "${SKILLRUNNER_LIB}/notify.sh"
+source "${SKILLRUNNER_LIB}/chrome.sh"
 
 SCHEDULE_ID="$1"
 
@@ -157,7 +158,7 @@ if [[ "$use_chrome" == "true" ]]; then
         # Display is available, ensure browser is running
         if ! pgrep -f "google-chrome" &>/dev/null; then
             log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Google Chrome"
-            nohup google-chrome-stable &>/dev/null &
+            nohup google-chrome-stable --remote-debugging-port=${CHROME_DEBUG_PORT} &>/dev/null &
             # Wait for browser to fully start and extension to connect
             sleep 15
             if ! pgrep -f "google-chrome" &>/dev/null; then
@@ -174,6 +175,18 @@ fi
 
 start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 start_epoch=$(date +%s)
+
+# Snapshot open Chrome tabs so we can clean up new ones after the run
+chrome_tabs_before=""
+if [[ "$use_chrome" == "true" && -z "$chrome_preflight_error" ]]; then
+    chrome_snapshot_tabs chrome_tabs_before
+    if [[ -n "$chrome_tabs_before" ]]; then
+        tab_count=$(echo "$chrome_tabs_before" | wc -l)
+        log_daemon "RUN ${RUN_ID}: Snapshotted ${tab_count} existing Chrome tabs for cleanup"
+    else
+        log_daemon "RUN ${RUN_ID}: Could not connect to Chrome CDP (port ${CHROME_DEBUG_PORT}) — tab cleanup will be skipped. If Chrome was already running, restart it or launch with --remote-debugging-port=${CHROME_DEBUG_PORT}"
+    fi
+fi
 
 log_daemon "RUN ${RUN_ID}: Starting ${run_type} '${run_name}' in ${workdir}"
 
@@ -324,6 +337,14 @@ log_entry=$(jq -cn \
 echo "$log_entry" >> "$RUNS_LOG"
 
 log_daemon "RUN ${RUN_ID}: ${run_type} '${run_name}' completed (${status}, ${duration}s, exit ${exit_code}, cost \$${cost})"
+
+# --- Chrome tab cleanup ---
+if [[ "$use_chrome" == "true" && -n "$chrome_tabs_before" ]]; then
+    closed=$(chrome_cleanup_tabs "$chrome_tabs_before")
+    if [[ -n "$closed" && "$closed" -gt 0 ]]; then
+        log_daemon "RUN ${RUN_ID}: Closed ${closed} Chrome tab(s) opened during run"
+    fi
+fi
 
 # --- Notification dispatch ---
 # Set notify_* variables for template expansion and dispatch
