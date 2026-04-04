@@ -18,7 +18,6 @@ SKILLRUNNER_LIB="${SKILLRUNNER_LIB:-$(cd "$(dirname "$0")/../lib" && pwd)}"
 source "${SKILLRUNNER_LIB}/logging.sh"
 source "${SKILLRUNNER_LIB}/lock.sh"
 source "${SKILLRUNNER_LIB}/notify.sh"
-source "${SKILLRUNNER_LIB}/chrome-launch.sh"
 
 SCHEDULE_ID="$1"
 
@@ -158,7 +157,7 @@ if [[ "$use_chrome" == "true" ]]; then
         # Display is available, ensure browser is running
         if ! pgrep -f "google-chrome" &>/dev/null; then
             log_daemon "RUN ${RUN_ID}: Chrome skill — no browser detected, launching Google Chrome"
-            nohup google-chrome-stable --remote-debugging-port=9222 &>/dev/null &
+            nohup google-chrome-stable &>/dev/null &
             # Wait for browser to fully start and extension to connect
             sleep 15
             if ! pgrep -f "google-chrome" &>/dev/null; then
