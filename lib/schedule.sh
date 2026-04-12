@@ -73,13 +73,7 @@ schedule_is_overdue() {
     local cron_min cron_hour cron_dom cron_mon cron_dow
     read -r cron_min cron_hour cron_dom cron_mon cron_dow <<< "$cron_expr"
 
-    # For large gaps, skip ahead hour-by-hour checking only the cron-matching
-    # minute within each hour, rather than iterating every minute or blindly
-    # returning overdue.
     local step=60
-    if (( end_epoch - check_epoch > 86400 )); then
-        step=3600
-    fi
 
     while (( check_epoch <= end_epoch )); do
         local min hour dom mon dow
